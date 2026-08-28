@@ -1,0 +1,230 @@
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    background: #f5f6f8;
+    font-family: Arial, sans-serif;
+    color: #222;
+}
+
+
+.container {
+    width: 900px;
+    max-width: calc(100% - 40px);
+    margin: 40px auto;
+}
+
+
+/* 뒤로가기 */
+
+.back {
+    display: inline-block;
+    margin-bottom: 20px;
+
+    color: #555;
+    text-decoration: none;
+}
+
+.back:hover {
+    text-decoration: underline;
+}
+
+
+/* 카드 */
+
+.card {
+    background: #fff;
+
+    border-radius: 10px;
+
+    padding: 30px;
+
+    margin-bottom: 20px;
+
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.05);
+}
+
+
+h1 {
+    margin: 0 0 25px;
+
+    font-size: 24px;
+}
+
+
+h2 {
+    margin: 0 0 20px;
+
+    font-size: 20px;
+}
+
+
+/* 민원 제목 */
+
+.title {
+    font-size: 22px;
+
+    font-weight: bold;
+
+    margin-bottom: 12px;
+}
+
+
+/* 작성자 / 작성일 */
+
+.info {
+    display: flex;
+
+    align-items: center;
+
+    gap: 20px;
+
+    padding-bottom: 20px;
+
+    border-bottom: 1px solid #eee;
+
+    color: #777;
+
+    font-size: 14px;
+}
+
+
+/* 민원 내용 */
+
+.inquiry-content {
+    margin-top: 20px;
+
+    line-height: 1.7;
+
+    word-break: break-word;
+
+    font-size: 15px;
+}
+
+
+/* 댓글 */
+
+.answer-box {
+    background: #f7f8fa;
+
+    border-radius: 8px;
+
+    padding: 20px;
+
+    margin-top: 10px;
+}
+
+
+/* 댓글 작성자 / 날짜 */
+
+.answer-header {
+    display: flex;
+
+    align-items: center;
+
+    justify-content: space-between;
+
+    padding-bottom: 12px;
+
+    margin-bottom: 15px;
+
+    border-bottom: 1px solid #e5e5e5;
+}
+
+
+.admin-name {
+    font-weight: bold;
+
+    font-size: 15px;
+}
+
+
+.date {
+    color: #888;
+
+    font-size: 13px;
+}
+
+
+/* 댓글 내용 */
+
+.answer-content {
+    line-height: 1.7;
+
+    word-break: break-word;
+
+    font-size: 15px;
+}
+
+
+/* 댓글 없음 */
+
+.no-answer {
+    color: #999;
+
+    padding: 10px 0;
+}
+
+
+/* 댓글 입력 */
+
+textarea {
+    display: block;
+
+    width: 100%;
+
+    min-height: 150px;
+
+    padding: 15px;
+
+    border: 1px solid #ddd;
+
+    border-radius: 6px;
+
+    font-family: inherit;
+
+    font-size: 15px;
+
+    line-height: 1.6;
+
+    resize: vertical;
+
+    outline: none;
+}
+
+
+textarea:focus {
+    border-color: #999;
+}
+
+
+/* 버튼 */
+
+button {
+    display: block;
+
+    margin-top: 12px;
+
+    margin-left: auto;
+
+    padding: 11px 24px;
+
+    border: none;
+
+    border-radius: 6px;
+
+    background: #222;
+
+    color: white;
+
+    font-size: 14px;
+
+    cursor: pointer;
+}
+
+
+button:hover {
+    background: #444;
+}

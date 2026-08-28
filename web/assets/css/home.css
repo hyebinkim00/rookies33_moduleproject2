@@ -1,0 +1,401 @@
+/* =========================
+   메인
+========================= */
+
+.hero {
+    min-height: 500px;
+
+    background: linear-gradient(
+        135deg,
+        #343a72 0%,
+        #4c5391 55%,
+        #6268a7 100%
+    );
+
+    color: #fff;
+}
+
+
+/* =========================
+   메인 영역
+========================= */
+
+.hero-inner {
+    width: 900px;
+    min-height: 500px;
+    margin: 0 auto;
+
+    display: flex;
+    align-items: center;
+}
+
+.hero-content {
+    padding-bottom: 30px;
+}
+
+
+/* =========================
+   텍스트
+========================= */
+
+.hero-label {
+    margin: 0 0 14px;
+
+    color: #d9dcff;
+
+    font-size: 14px;
+    font-weight: 500;
+}
+
+.hero-content h1 {
+    margin: 0;
+
+    font-size: 46px;
+    line-height: 1.2;
+    letter-spacing: -2px;
+}
+
+.hero-content h1 strong {
+    color: #e5eb72;
+}
+
+.hero-description {
+    margin: 22px 0 28px;
+
+    color: rgba(255, 255, 255, 0.82);
+
+    font-size: 15px;
+    line-height: 1.7;
+}
+
+
+/* =========================
+   버튼
+========================= */
+
+.hero-buttons {
+    display: flex;
+    gap: 10px;
+}
+
+.hero-primary,
+.hero-secondary {
+    height: 42px;
+    padding: 0 20px;
+
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+
+    border-radius: 3px;
+
+    font-size: 14px;
+    font-weight: 600;
+    text-decoration: none;
+
+    transition: 0.2s;
+}
+
+
+/* 민원 신청 */
+
+.hero-primary {
+    border: 1px solid #fff;
+
+    background: #fff;
+    color: #343a72;
+}
+
+.hero-primary:hover {
+    background: #f2f3fa;
+}
+
+
+/* 민원 게시판 */
+
+.hero-secondary {
+    border: 1px solid rgba(255, 255, 255, 0.75);
+
+    color: #fff;
+    background: transparent;
+}
+
+.hero-secondary:hover {
+    background: rgba(255, 255, 255, 0.1);
+}
+
+
+/* =========================
+   반응형
+========================= */
+
+@media (max-width: 950px) {
+
+    .hero-inner {
+        width: calc(100% - 40px);
+    }
+
+}
+
+@media (max-width: 600px) {
+
+    .hero {
+        min-height: 430px;
+    }
+
+    .hero-inner {
+        min-height: 430px;
+    }
+
+    .hero-content h1 {
+        font-size: 36px;
+    }
+
+    .hero-description {
+        font-size: 14px;
+    }
+}
+
+/* =========================
+   최근 민원 + 처리 안내
+========================= */
+
+.home-info-section {
+    padding: 55px 0 70px;
+    background: #f5f7fa;
+}
+
+.home-info-inner {
+    width: 1000px;
+    margin: 0 auto;
+
+    display: grid;
+    grid-template-columns: 2fr 1fr;
+    gap: 24px;
+}
+
+
+/* =========================
+   최근 공개 민원
+========================= */
+
+.recent-box {
+    background: #fff;
+    border: 1px solid #e1e4e8;
+}
+
+.home-box-header {
+    height: 65px;
+    padding: 0 22px;
+
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+
+    border-bottom: 1px solid #e1e4e8;
+}
+
+.home-box-header h2 {
+    margin: 0;
+
+    color: #222;
+    font-size: 20px;
+}
+
+.home-box-header a {
+    color: #777;
+    font-size: 13px;
+    text-decoration: none;
+}
+
+.home-box-header a:hover {
+    color: #343a72;
+}
+
+.recent-list {
+    width: 100%;
+}
+
+.recent-item {
+    min-height: 55px;
+
+    padding: 0 20px;
+
+    display: grid;
+    grid-template-columns: 1fr 100px 110px;
+    align-items: center;
+
+    border-bottom: 1px solid #eee;
+
+    color: #222;
+    font-size: 14px;
+    text-decoration: none;
+}
+
+.recent-item:last-child {
+    border-bottom: 0;
+}
+
+.recent-item:hover {
+    background: #fafbfc;
+}
+
+.recent-title {
+    overflow: hidden;
+
+    white-space: nowrap;
+    text-overflow: ellipsis;
+}
+
+.recent-status {
+    text-align: center;
+}
+
+.recent-date {
+    text-align: center;
+
+    color: #777;
+    font-size: 13px;
+}
+
+.status-received {
+    color: #666;
+}
+
+.status-completed {
+    color: #343a72;
+    font-weight: 600;
+}
+
+.recent-empty {
+    padding: 70px 20px;
+
+    color: #888;
+    font-size: 14px;
+    text-align: center;
+}
+
+
+/* =========================
+   민원 처리 안내
+========================= */
+
+.process-box {
+    padding: 24px;
+
+    background: #343a72;
+    color: #fff;
+}
+
+.process-header {
+    padding-bottom: 18px;
+    margin-bottom: 22px;
+
+    border-bottom: 1px solid rgba(255, 255, 255, 0.18);
+}
+
+.process-header h2 {
+    margin: 0 0 8px;
+
+    font-size: 20px;
+}
+
+.process-header p {
+    margin: 0;
+
+    color: rgba(255, 255, 255, 0.7);
+    font-size: 13px;
+    line-height: 1.5;
+}
+
+.process-list {
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+}
+
+.process-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 14px;
+}
+
+.process-number {
+    width: 38px;
+    height: 38px;
+
+    flex-shrink: 0;
+
+    display: flex;
+    align-items: center;
+    justify-content: center;
+
+    border: 1px solid rgba(255, 255, 255, 0.55);
+    border-radius: 50%;
+
+    color: #e5eb72;
+
+    font-size: 12px;
+    font-weight: bold;
+}
+
+.process-item strong {
+    display: block;
+
+    margin-bottom: 5px;
+
+    font-size: 15px;
+}
+
+.process-item p {
+    margin: 0;
+
+    color: rgba(255, 255, 255, 0.7);
+
+    font-size: 12px;
+    line-height: 1.5;
+}
+
+.process-button {
+    height: 42px;
+
+    margin-top: 25px;
+
+    display: flex;
+    align-items: center;
+    justify-content: center;
+
+    background: #fff;
+
+    color: #343a72;
+
+    font-size: 14px;
+    font-weight: 600;
+
+    text-decoration: none;
+}
+
+.process-button:hover {
+    background: #f3f4fa;
+}
+
+
+/* =========================
+   반응형
+========================= */
+
+@media (max-width: 1050px) {
+
+    .home-info-inner {
+        width: calc(100% - 40px);
+    }
+
+}
+
+@media (max-width: 750px) {
+
+    .home-info-inner {
+        grid-template-columns: 1fr;
+    }
+
+}
