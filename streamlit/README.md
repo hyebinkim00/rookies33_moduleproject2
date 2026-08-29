@@ -1,110 +1,192 @@
-## AI 기반 웹 취약점 자동 진단 시스템
+# AI 기반 웹 취약점 자동 진단 시스템
 
-웹 애플리케이션의 주요 취약점을 자동으로 진단하고, Streamlit 대시보드를 통해 결과를 확인할 수 있는 프로젝트입니다.
+생성형 AI와 Python 기반 자동화 스캐너를 활용하여 웹 서비스의 주요 취약점을 자동으로 진단하고, 결과를 시각화 및 보고서 형태로 제공하는 프로젝트입니다.
 
-## 주요 기능
-SQL Injection 취약점 자동 진단
-XSS 취약점 자동 진단
-세션/인증 취약점 자동 진단
-파일 업로드 취약점 자동 진단
-OpenAI 기반 취약점 분석 및 대응방안 제공
-수동 진단 결과 업로드 및 자동 진단 결과 비교
-PDF / XLSX 진단 보고서 생성
+본 프로젝트는 **수동 취약점 진단 과정의 반복 작업을 자동화하고, AI를 활용해 진단 결과와 대응 방안을 제공하는 것**을 목표로 합니다.
 
-## 실행 환경
-Python 3.x
-Streamlit
-FastAPI
-Docker 기반 진단 대상 웹 서비스
+---
 
-## 1. 프로젝트 다운로드
+## 1. 프로젝트 개요
 
-저장소를 Clone하거나 ZIP 파일로 다운로드합니다.
+웹 취약점 진단 과정에서는 대상 서비스에 대한 점검, 취약 여부 판단, 결과 정리, 대응 방안 작성 등 반복적인 작업이 발생합니다.
 
-이후 streamlit 디렉터리로 이동합니다.
+본 프로젝트에서는 주요 웹 취약점에 대한 Python 기반 자동 진단 모듈을 구현하고, 각 스캐너의 결과를 통합 API를 통해 수집하여 Streamlit 대시보드에서 확인할 수 있도록 구성했습니다.
 
-cd streamlit
+또한 수동 진단 결과와 자동 진단 결과를 비교하여 자동화 진단의 일치 여부를 확인하고, 생성형 AI를 활용해 진단 결과에 대한 분석 및 대응 방안을 제공합니다.
 
-## 2. 가상환경 생성 및 활성화
+---
 
-Windows 기준:
+## 2. 주요 기능
 
-python -m venv .venv
-.venv\Scripts\activate
+- 웹 취약점 자동 진단
+- 여러 취약점 스캐너 결과 통합
+- 수동 진단 / 자동 진단 결과 비교
+- 취약점 위험도 및 진단 결과 시각화
+- 생성형 AI 기반 진단 결과 분석
+- 취약점별 대응 방안 제공
+- PDF 진단 결과 보고서 생성
+- XLSX 진단 결과 보고서 생성
 
-## 3. 패키지 설치
+---
+
+## 3. 진단 항목
+
+현재 자동 진단 시스템에서는 다음과 같은 주요 웹 취약점을 진단합니다.
+
+| 구분 | 주요 진단 내용 |
+| --- | --- |
+| SQL Injection | Error/Boolean 기반 SQL Injection 진단 |
+| XSS | 웹 입력값 및 DOM 기반 XSS 진단 |
+| Session / Authentication | 세션 및 인증 관련 취약점 진단 |
+| File Upload | 파일 업로드 검증, 업로드 파일 접근 및 보안 설정 진단 |
+
+각 진단 모듈의 결과는 통합 API에서 하나의 결과 형식으로 수집되어 Streamlit 대시보드로 전달됩니다.
+
+---
+
+## 4. 시스템 구성
+
+```text
+[진단 대상 웹 서비스]
+          │
+          ▼
+[Python 취약점 자동 진단 모듈]
+   ├─ SQL Injection Scanner
+   ├─ XSS Scanner
+   ├─ Session Scanner
+   └─ File Upload Scanner
+          │
+          ▼
+[Unified Scanner API]
+          │
+          ▼
+[Streamlit Dashboard]
+   ├─ 진단 결과 통합
+   ├─ 수동/자동 진단 비교
+   ├─ 위험도 시각화
+   ├─ AI 분석 및 대응 방안
+   └─ PDF / XLSX 보고서 생성
+```
+
+---
+
+## 5. 주요 파일
+
+| 파일 | 역할 |
+| --- | --- |
+| `app.py` | Streamlit 기반 메인 대시보드 |
+| `unified_scanner_api.py` | 각 취약점 진단 모듈을 호출하는 통합 API |
+| `sqli_scanner.py` | SQL Injection 자동 진단 |
+| `xss_scanner_ai.py` | XSS 자동 진단 |
+| `session_scanner.py` | 세션 및 인증 관련 취약점 진단 |
+| `ver6_file_upload_vuln_scanner.py` | 파일 업로드 관련 취약점 진단 |
+| `ai_analyzer.py` | AI 기반 진단 결과 분석 및 대응 방안 생성 |
+| `hf_analyzer.py` | 분석 기능 보조 모듈 |
+| `pdf_report.py` | PDF 진단 결과 보고서 생성 |
+| `xlsx_report.py` | XLSX 진단 결과 보고서 생성 |
+| `requirements.txt` | 프로젝트 실행에 필요한 Python 패키지 |
+
+---
+
+## 6. 진단 프로세스
+
+```text
+1. 진단 대상 URL 입력
+        ↓
+2. 자동 진단 요청
+        ↓
+3. 취약점별 Scanner 실행
+        ↓
+4. Unified Scanner API에서 결과 통합
+        ↓
+5. Streamlit Dashboard에 결과 전달
+        ↓
+6. 취약 / 양호 / N/A 결과 표시
+        ↓
+7. 수동 진단 결과와 자동 진단 결과 비교
+        ↓
+8. AI 기반 결과 분석 및 대응 방안 제공
+        ↓
+9. PDF / XLSX 보고서 생성
+```
+
+---
+
+## 7. 실행 방법
+
+### 패키지 설치
+
+```bash
 pip install -r requirements.txt
+```
 
-## 4. OpenAI API Key 설정
+### 환경 변수 설정
 
-.env.example 파일을 복사하여 .env 파일을 생성합니다.
+`.env.example`을 참고하여 필요한 환경 변수를 `.env` 파일에 설정합니다.
 
-OPENAI_API_KEY=본인의_API_KEY
+> `.env` 파일은 API Key 등 민감정보가 포함될 수 있으므로 Git 저장소에 업로드하지 않습니다.
 
-.env 파일에는 실제 API Key가 포함되므로 GitHub에 업로드하지 않습니다.
+### 통합 Scanner API 실행
 
-## 5. 진단 대상 웹 서비스 실행
-
-Docker를 이용하여 진단 대상 웹 서비스를 먼저 실행합니다.
-
-예시:
-
-http://localhost:8081
-
-실제 포트 또는 주소가 다른 경우 본인의 실행 환경에 맞는 URL을 사용합니다.
-
-## 6. 통합 Scanner API 실행
-
-첫 번째 터미널에서 다음 명령어를 실행합니다.
-
+```bash
 uvicorn unified_scanner_api:app --host 0.0.0.0 --port 8001
+```
 
-Scanner API 기본 주소:
+### Streamlit 실행
 
-http://127.0.0.1:8001
+별도의 터미널에서 다음 명령어를 실행합니다.
 
-## 7. Streamlit 실행
-
-새로운 터미널을 열고 가상환경을 활성화한 뒤 실행합니다.
-
+```bash
 streamlit run app.py
+```
 
-실행 후 브라우저에서 Streamlit 대시보드에 접속합니다.
+기본 통합 Scanner API 주소:
 
-기본 주소:
+```text
+http://127.0.0.1:8001/api/v1/scan/all
+```
 
-http://localhost:8501
+---
 
-## 8. 취약점 진단
+## 8. 진단 결과
 
-Streamlit 대시보드에서 진단 대상 URL을 입력합니다.
+자동 진단 결과는 다음 상태로 구분하여 표시합니다.
 
-예시:
+- **취약**: 취약점이 탐지된 경우
+- **양호**: 해당 점검 항목에서 취약점이 탐지되지 않은 경우
+- **N/A**: 환경 또는 진단 조건에 의해 판정할 수 없는 경우
 
-http://localhost:8081
+Streamlit 대시보드에서는 진단 결과와 위험도를 시각화하고, 수동 진단 결과와 자동 진단 결과의 일치 여부를 함께 확인할 수 있습니다.
 
-진단을 실행하면 각 Scanner의 결과가 통합되어 대시보드에 표시됩니다.
+---
 
-## 프로젝트 구성
-streamlit/
-├── app.py
-├── unified_scanner_api.py
-├── sqli_scanner.py
-├── session_scanner.py
-├── ver4_file_upload_vuln_scanner.py
-├── xss_crawler_scanner_improved.py
-├── xss_scanner_add_dom.py
-├── ai_analyzer.py
-├── hf_analyzer.py
-├── pdf_report.py
-├── xlsx_report.py
-├── requirements.txt
-├── .env.example
-├── .gitignore
-└── README.md
+## 9. AI 활용
+
+자동 스캐너가 실제 취약점 탐지와 판정을 수행하고, 생성형 AI는 진단 결과를 기반으로 다음과 같은 분석을 지원합니다.
+
+- 취약점 진단 결과 해석
+- 취약점 위험성 설명
+- 취약점별 대응 방안 제시
+- 결과 보고서 작성 지원
+
+이를 통해 **자동화 스캐너의 정형화된 진단 결과와 생성형 AI의 분석 기능을 결합**하여 취약점 진단 업무의 효율성을 높이고자 했습니다.
+
+---
+
+## 10. 프로젝트 목표
+
+본 프로젝트의 핵심은 생성형 AI가 직접 모든 취약점을 판단하도록 구성하는 것이 아니라,
+
+**자동화 스캐너를 통한 취약점 탐지 → 결과 통합 → AI 분석 → 시각화 및 보고서 생성**
+
+과정을 하나의 시스템으로 연결하여 기존 수동 진단 과정의 반복 업무를 자동화하는 것입니다.
+
+이를 통해 진단 결과의 일관성을 확보하고, 취약점 분석 및 보고서 작성에 필요한 시간을 줄이는 것을 목표로 합니다.
+
+---
 
 ## 주의사항
 
-본 프로젝트의 취약점 진단 기능은 교육 및 허가된 테스트 환경에서의 사용을 목적으로 합니다.
+본 프로젝트의 취약점 진단 기능은 **교육 및 보안 점검 목적으로 구현되었습니다.**
 
-허가받지 않은 시스템을 대상으로 진단을 수행하지 마십시오.
+허가받지 않은 시스템을 대상으로 취약점 진단 또는 공격을 수행해서는 안 되며, 반드시 본인이 소유하거나 명시적으로 진단 권한을 부여받은 환경에서만 사용해야 합니다.
