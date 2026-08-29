@@ -445,7 +445,7 @@ def generate_xlsx_report(
     style_title(
         summary_sheet,
         "A1:H1",
-        "AI 기반 공공 민원포털 취약점 자동 진단 결과"
+        "진단 결과 보고서"
     )
 
     # 기본 정보 카드

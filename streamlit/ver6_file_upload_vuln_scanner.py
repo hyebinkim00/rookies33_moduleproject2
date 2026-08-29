@@ -19,6 +19,19 @@ FileFormatNameAnalyzer 모듈을 통해, 서버 응답에 의존하지 않고도
 ⚠️ 반드시 진단 권한이 있는 대상(자체 구축 랩 환경, 사내 승인된 시스템 등)에만
 사용하세요.
 
+--------------------------------------------------------------------------------
+2팀 통합: 이 파일 하나에서 나머지 3개 진단 도구도 함께 불러올 수 있습니다
+--------------------------------------------------------------------------------
+sqli_scanner.py(SQL Injection), session_scanner.py(세션/인증), xss_scanner_ai.py(XSS)는
+팀원이 각자 만든 별도 파일이며, 이 파일은 그 셋의 로직을 전혀 고치지 않고 모듈째로
+불러와 sqli_scanner / session_scanner / xss_scanner_ai 세 이름으로 재노출합니다.
+즉 unified_scanner_api.py 등 다른 코드는 이 파일 하나만 import해도 네 도구 모두에
+접근할 수 있습니다 (import file_upload_vuln_scanner as fu; fu.sqli_scanner.run_all(...)).
+세 파일이 실제로 옆에 없거나(xss_scanner_ai.py는 playwright도 필요) 못 불러와도
+이 파일 자체는 정상 동작하며, 해당 이름은 None이 되고 이유는 각각
+_sqli_scanner_import_error / _session_scanner_import_error / _xss_scanner_ai_import_error에
+담깁니다 (기존 CodeBERT/pypdf 등과 동일하게 방어적으로 처리).
+
 필요 패키지:
     pip install requests transformers torch
 """
@@ -39,12 +52,63 @@ import uuid
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from typing import Optional, List, Dict, Any, Tuple
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import numpy as np
 import requests
 
+# .env 파일이 있으면 그 안의 KEY=VALUE 줄들을 자동으로 환경변수로 로드한다.
+# (OPENAI_API_KEY를 이 방식으로 관리하는 팀을 위함 — python-dotenv가 없으면
+# 조용히 건너뛰고, 기존처럼 실제 셸 환경변수만으로도 동작한다. 즉 이 기능은
+# 순전히 편의 기능이며 없어도 OPENAI_API_KEY를 export해서 쓰면 그대로 작동한다.)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 TOOL_VERSION = "0.5.0"
+
+
+# --------------------------------------------------------------------------- #
+# 2팀 통합: 나머지 3개 진단 도구를 모듈째로 불러와 재노출
+# (각 파일의 내부 로직은 전혀 건드리지 않고 그대로 가져온다 — 있는 그대로 적용)
+# --------------------------------------------------------------------------- #
+
+try:
+    import sqli_scanner
+    _sqli_scanner_import_error: Optional[str] = None
+except ImportError as e:
+    sqli_scanner = None
+    _sqli_scanner_import_error = str(e)
+
+try:
+    import session_scanner
+    _session_scanner_import_error: Optional[str] = None
+except ImportError as e:
+    session_scanner = None
+    _session_scanner_import_error = str(e)
+
+try:
+    import xss_scanner_ai
+    _xss_scanner_ai_import_error: Optional[str] = None
+except ImportError as e:
+    # xss_scanner_ai.py는 playwright(헤드리스 브라우저)가 반드시 있어야 임포트되므로,
+    # 설치가 안 된 환경에서도 이 파일(및 파일 업로드 진단)은 그대로 쓸 수 있게
+    # 방어적으로 처리한다 (기존 CodeBERT/pypdf 미설치 대응과 동일한 패턴).
+    xss_scanner_ai = None
+    _xss_scanner_ai_import_error = str(e)
+
+
+def available_scanners() -> Dict[str, bool]:
+    """이 파일을 통해 지금 실제로 쓸 수 있는 진단 도구가 뭔지 한눈에 확인할 때 사용.
+    예: {"file_upload": True, "sqli": True, "session": True, "xss": False}"""
+    return {
+        "file_upload": True,
+        "sqli": sqli_scanner is not None,
+        "session": session_scanner is not None,
+        "xss": xss_scanner_ai is not None,
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -581,6 +645,105 @@ class ContentPatternScanner:
 # 파일 업로드 취약점 스캐너 (블랙박스, 대상 서버에 실제 요청 전송)
 # --------------------------------------------------------------------------- #
 
+class AIResponseJudge:
+    """
+    _classify_response가 규칙(상태코드/Content-Type/본문 유사도)만으로는
+    success/blocked를 확정하지 못해 'ambiguous'로 남기려는 지점에서만 개입해,
+    OpenAI(gpt-5.6-sol)에게 베이스라인 응답과 이번 응답을 함께 보여주고
+    최종 판정을 내리게 한다.
+
+    중요: 규칙 기반 판정이 이미 확신을 가진 경우(auth_or_waf_blocked, 명확한
+    success/blocked)에는 이 클래스가 절대 호출되지 않는다 — AI는 "규칙이 판단을
+    못 내리는 지점"만 메우는 역할이지, 기존 판정을 뒤집거나 대체하지 않는다.
+
+    이 판정은 한국인터넷진흥원(KISA)의 「주요정보통신기반시설 기술적 취약점
+    분석·평가 방법 상세가이드」 Web Application(웹) 보안 분야 14번 항목
+    '악성 파일 업로드'(항목코드 FU, 위험도 상)를 자동으로 점검하는 과정의
+    일부다. 이 항목이 공식적으로 요구하는 확인 대상은 두 가지다 —
+    ① 업로드 파일에 대한 확장자 검증이 이루어지는지, ② 업로드 경로에
+    접근했을 때 실제로 정상 실행되는지. judge()가 내리는 success/blocked
+    판정은 그중 ①(필터를 통과했는지)에 해당하는 판단이며, ②(실행 여부)는
+    FileUploadVulnScanner._verify_php_execution()이 별도로 검증한다.
+    """
+
+    GUIDE_REFERENCE = (
+        "주요정보통신기반시설 기술적 취약점 분석·평가 방법 상세가이드 - "
+        "Web Application(웹) 보안 14. 악성 파일 업로드 (항목코드 FU, 위험도 상)"
+    )
+    DEFAULT_MODEL = "gpt-5.6-sol"
+
+    def __init__(self, api_key: Optional[str] = None, model: str = DEFAULT_MODEL):
+        self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
+        self.model = model
+        self._client = None
+
+    def _get_client(self):
+        if self._client is not None:
+            return self._client
+        try:
+            from openai import OpenAI
+        except ImportError as e:
+            raise RuntimeError(
+                "openai 패키지가 설치되어 있지 않습니다. `pip install openai` 로 설치 후 다시 시도하세요."
+            ) from e
+        if not self.api_key:
+            raise RuntimeError(
+                "OpenAI API 키가 없습니다. AIResponseJudge(api_key=...)로 직접 넘기거나 "
+                "환경변수 OPENAI_API_KEY를 설정하세요."
+            )
+        self._client = OpenAI(api_key=self.api_key)
+        return self._client
+
+    def judge(self, baseline_status: int, baseline_ctype: str, baseline_body: str,
+              this_status: int, this_ctype: str, this_body: str) -> Dict[str, str]:
+        """베이스라인(정상 업로드) 응답과 이번 응답을 비교시켜 {"verdict": "success"|"blocked",
+        "reasoning": "..."}를 반환한다. verdict가 이 둘 중 하나가 아니면 예외를 던진다
+        (호출부가 그 경우 'ambiguous'로 안전하게 폴백하도록)."""
+        client = self._get_client()
+        prompt = (
+            f"이 진단은 한국인터넷진흥원(KISA)의 「주요정보통신기반시설 기술적 취약점 분석·평가 "
+            f"방법 상세가이드」 중 {self.GUIDE_REFERENCE}을 자동으로 점검하는 과정의 일부다. "
+            "이 항목의 공식 확인 대상 중 하나는 '업로드 파일에 대한 확장자 검증이 이루어지는지'다. "
+            "지금 요청하는 것은 그 확인에 해당한다 — 즉 이번 업로드 시도가 그 검증(필터)을 "
+            "통과했는지(success) 아니면 걸러졌는지(blocked)를 판단하는 것이다. 실제 코드 실행 "
+            "여부는 이 판단과 별개로 이후 단계에서 확인하니, 여기서는 다루지 말 것.\n\n"
+            "다음은 파일 업로드 엔드포인트에서 얻은 두 HTTP 응답이다. 규칙 기반 로직(상태코드/"
+            "Content-Type/본문 유사도 비교)만으로는 이번 응답이 성공인지 차단인지 명확히 가르지 "
+            "못해 최종 판단을 요청한다.\n\n"
+            "[베이스라인 = 정상 파일 업로드가 성공했을 때의 응답]\n"
+            f"상태코드: {baseline_status}\n"
+            f"Content-Type: {baseline_ctype}\n"
+            f"본문(최대 1500자): {baseline_body[:1500]}\n\n"
+            "[이번 응답 = 진단 중인 파일 업로드 시도의 결과]\n"
+            f"상태코드: {this_status}\n"
+            f"Content-Type: {this_ctype}\n"
+            f"본문(최대 1500자): {this_body[:1500]}\n\n"
+            "이번 응답이 베이스라인과 실질적으로 같은 '성공'(확장자 검증을 통과함) 처리인지, "
+            "아니면 다르게(확장자 검증 등 필터에 의해 차단/거부되어) 처리된 것인지 판단해라. "
+            "새로운 사실을 지어내지 말고 주어진 두 응답의 차이만 근거로 판단할 것.\n\n"
+            '반드시 다음 JSON 형식으로만 답하라: {"verdict": "success 또는 blocked", '
+            '"reasoning": "판단 근거를 한 문장으로"}'
+        )
+        response = client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": "너는 주요정보통신기반시설 기술적 취약점 분석·평가 "
+                                               "가이드의 파일 업로드(FU) 항목 점검을 보조하는 도구로, "
+                                               "HTTP 응답 두 개를 비교해 업로드 필터 통과(success)/"
+                                               "차단(blocked) 여부를 판단한다. 반드시 JSON으로만 답하라."},
+                {"role": "user", "content": prompt},
+            ],
+            response_format={"type": "json_object"},
+        )
+        content = response.choices[0].message.content
+        data = json.loads(content)
+        verdict = str(data.get("verdict", "")).strip().lower()
+        reasoning = str(data.get("reasoning", "")).strip()
+        if verdict not in ("success", "blocked"):
+            raise ValueError(f"AI가 success/blocked 중 하나가 아닌 값을 반환함: {verdict!r}")
+        return {"verdict": verdict, "reasoning": reasoning}
+
+
 class FileUploadVulnScanner:
     """
     대상 URL의 파일 업로드 엔드포인트에 대해 여러 우회 기법을 시도하는 블랙박스
@@ -652,6 +815,9 @@ class FileUploadVulnScanner:
         max_retries: int = 1,
         request_delay: float = 0.3,
         cleanup: bool = False,
+        ai_judge_ambiguous: bool = False,
+        openai_api_key: Optional[str] = None,
+        ai_model: str = AIResponseJudge.DEFAULT_MODEL,
     ):
         if target_url != "(offline)" and not target_url.lower().startswith(("http://", "https://")):
             raise ValueError(
@@ -674,6 +840,16 @@ class FileUploadVulnScanner:
         self.cleanup = cleanup
         self.session = requests.Session()
 
+        # ai_judge_ambiguous=True면, 규칙 기반으로 성공/차단을 못 가르는 지점(ambiguous)에서만
+        # AIResponseJudge를 호출해 최종 판정을 받는다. 기본값은 False — AI 없이도 도구가
+        # 그대로 동작해야 하므로, 켜고 싶을 때만 명시적으로 켜도록 opt-in으로 뒀다.
+        self._ai_judge: Optional[AIResponseJudge] = (
+            AIResponseJudge(api_key=openai_api_key, model=ai_model) if ai_judge_ambiguous else None
+        )
+        # AI가 개입해 성공/차단을 확정한 이력을 전부 남긴다 (감사 가능성 확보).
+        # save_json()의 리포트에 그대로 포함된다.
+        self.ai_judged_log: List[Dict[str, Any]] = []
+
         self.results: List[DiagnosisResult] = []
         self.format_analyzer = FileFormatNameAnalyzer()
         self._server_header: Optional[str] = None
@@ -682,6 +858,13 @@ class FileUploadVulnScanner:
         # run_all() 시작 시 _establish_baseline()이 채움. None이면 베이스라인 학습에
         # 실패한 것이므로 이후 판정은 키워드 휴리스틱으로 폴백한다.
         self.baseline: Optional[Dict[str, Any]] = None
+        # 베이스라인 업로드의 원본 requests.Response 객체. check_serving_security_headers처럼
+        # 베이스라인 파일에 다시 접근해야 하는 체크가 저장 경로 자동 추출에 재사용한다.
+        self._baseline_resp: Optional[requests.Response] = None
+        # _guess_common_upload_path()가 채움. 한 번 성공하면 그 base를 이번 실행 내내
+        # 재사용해 매 체크마다 여러 경로를 다시 찔러보지 않게 한다.
+        self._guessed_upload_base: Optional[str] = None
+        self._upload_guess_attempted = False
         self._waf_suspected = False
         self._last_classification_detail: str = ""
 
@@ -830,10 +1013,9 @@ class FileUploadVulnScanner:
         if baseline_keys is not None:
             this_keys = self._json_top_level_keys(resp)
             if this_keys is None:
-                self._last_classification_detail = (
-                    "베이스라인은 JSON 응답이었으나 이번 응답은 JSON으로 파싱되지 않아 애매함"
+                return self._resolve_ambiguous(
+                    resp, "베이스라인은 JSON 응답이었으나 이번 응답은 JSON으로 파싱되지 않아 애매함"
                 )
-                return "ambiguous"
             if this_keys == baseline_keys:
                 self._last_classification_detail = (
                     f"JSON 최상위 키 집합이 베이스라인과 동일함({sorted(this_keys)}) → 성공으로 판단"
@@ -848,10 +1030,9 @@ class FileUploadVulnScanner:
                     f"이번 응답: {sorted(this_keys)}) → 차단/다른 처리 경로로 판단"
                 )
                 return "blocked"
-            self._last_classification_detail = (
-                f"JSON 키 집합이 베이스라인과 부분적으로만 겹침(겹침 비율 {key_overlap:.2f}) → 자동 판정 신뢰도 낮음"
+            return self._resolve_ambiguous(
+                resp, f"JSON 키 집합이 베이스라인과 부분적으로만 겹침(겹침 비율 {key_overlap:.2f})"
             )
-            return "ambiguous"
 
         baseline_body = self.baseline.get("body_text") or ""
         this_body = resp.text or ""
@@ -869,11 +1050,51 @@ class FileUploadVulnScanner:
                 f"→ 차단(다른 안내 페이지 등)으로 판단"
             )
             return "blocked"
-        self._last_classification_detail = (
-            f"본문 유사도가 애매한 구간임(유사도 {similarity:.2f}, 성공 기준 {self.BODY_SIMILARITY_SUCCESS_THRESHOLD} / "
-            f"차단 기준 {self.BODY_SIMILARITY_BLOCKED_THRESHOLD}) → 자동 판정 신뢰도 낮음"
+        return self._resolve_ambiguous(
+            resp,
+            f"본문 유사도가 애매한 구간임(유사도 {similarity:.2f}, 성공 기준 "
+            f"{self.BODY_SIMILARITY_SUCCESS_THRESHOLD} / 차단 기준 {self.BODY_SIMILARITY_BLOCKED_THRESHOLD})",
         )
-        return "ambiguous"
+
+    def _resolve_ambiguous(self, resp: requests.Response, fallback_detail: str) -> str:
+        """규칙 기반 판정이 'ambiguous'로 남기려는 지점에서, AI 판정이 켜져 있으면
+        gpt-5.6-sol에게 베이스라인과 이번 응답을 비교시켜 success/blocked 중 하나로
+        확정한다. AI가 꺼져 있거나 호출 자체가 실패하면(키 누락, 네트워크 오류,
+        예상 밖 응답 형식 등) 기존처럼 'ambiguous'로 안전하게 남긴다 — AI 문제 때문에
+        스캐너가 죽거나 근거 없이 확신을 내는 일은 없어야 하므로."""
+        if self._ai_judge is None:
+            self._last_classification_detail = fallback_detail
+            return "ambiguous"
+
+        baseline_body = self.baseline.get("body_text") or ""
+        this_body = resp.text[:2000] if resp.text else ""
+        try:
+            verdict_info = self._ai_judge.judge(
+                baseline_status=self.baseline["status_code"],
+                baseline_ctype=self.baseline["content_type"],
+                baseline_body=baseline_body,
+                this_status=resp.status_code,
+                this_ctype=resp.headers.get("Content-Type", ""),
+                this_body=this_body,
+            )
+        except Exception as e:
+            self._last_classification_detail = f"{fallback_detail} (AI 판정을 시도했으나 실패: {e})"
+            return "ambiguous"
+
+        verdict = verdict_info["verdict"]
+        self.ai_judged_log.append({
+            "http_status": resp.status_code,
+            "verdict": verdict,
+            "reasoning": verdict_info["reasoning"],
+            "model": self._ai_judge.model,
+            "guide_reference": self._ai_judge.GUIDE_REFERENCE,
+            "judged_at": datetime.now().isoformat(),
+        })
+        self._last_classification_detail = (
+            f"{fallback_detail} → 규칙만으로는 판정 불가해 AI({self._ai_judge.model})가 베이스라인과 "
+            f"이번 응답을 비교해 최종 판정함: {verdict_info['reasoning']} (판정: {verdict})"
+        )
+        return verdict
 
     def _extract_storage_url(self, resp: Optional[requests.Response], filename: str) -> Optional[str]:
         """업로드 성공 응답(JSON 또는 텍스트)에서 저장 경로/URL을 최대한 추출한다.
@@ -881,7 +1102,15 @@ class FileUploadVulnScanner:
         if resp is None:
             return None
 
-        # 1) Location 헤더 (201 Created + Location, 또는 리다이렉트)
+        # 0) requests는 기본적으로 리다이렉트를 자동으로 따라가므로, "POST /upload
+        # → 302 Location: /uploads/파일명 → (자동으로 따라가서) 최종 GET 응답"인
+        # 경우 Location 헤더는 이미 resp.history[0]에만 남고 최종 resp에는 없다.
+        # 이런 흔한 REST 패턴을 놓치지 않도록, 리다이렉트를 거쳐 도착한 최종 URL에
+        # 파일명이 포함되어 있으면 그 자체를 저장 경로로 우선 사용한다.
+        if resp.history and filename in resp.url:
+            return resp.url
+
+        # 1) Location 헤더 (201 Created + Location, 또는 리다이렉트를 안 따라간 경우)
         loc = resp.headers.get("Location")
         if loc:
             return loc
@@ -941,21 +1170,66 @@ class FileUploadVulnScanner:
             return self.uploaded_file_base_url.rstrip("/") + "/" + filename
         return None
 
+    # --uploaded-base-url도 안 주고 응답에서 자동 추출도 실패했을 때 마지막으로
+    # 시도해볼 흔한 업로드 디렉터리 관례들. 실제로 응답을 받아보고 HTTP 200이
+    # 나오는 것만 채택하므로, 잘못된 경로의 404 에러 페이지를 파일로 착각해
+    # 헤더를 잘못 읽는 일은 없다.
+    COMMON_UPLOAD_DIR_GUESSES = ("/uploads", "/upload", "/files", "/attachments", "/src/uploads", "/static/uploads")
+
+    def _guess_common_upload_path(self, filename: str) -> Optional[requests.Response]:
+        """흔한 업로드 디렉터리 이름들을 대상 origin 기준으로 하나씩 실제로
+        요청해보고, 처음으로 HTTP 200이 나오는 경로를 이번 실행 내내 재사용한다.
+        --uploaded-base-url을 몰라도, 그리고 응답에서 경로를 추출하지 못해도
+        마지막 안전망 역할을 한다 (다만 어디까지나 관례에 대한 추측이므로,
+        200이 나온다는 것 자체가 그 파일이 맞다는 보장은 아니라는 점은 유의할 것)."""
+        if self._upload_guess_attempted:
+            if self._guessed_upload_base is None:
+                return None
+            try:
+                return self.session.get(
+                    self._guessed_upload_base.rstrip("/") + "/" + filename,
+                    timeout=self.timeout, verify=self.verify_ssl,
+                    headers=self.headers, cookies=self.cookies,
+                )
+            except requests.RequestException:
+                return None
+
+        self._upload_guess_attempted = True
+        parsed = urlparse(self.target_url)
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        for guess_path in self.COMMON_UPLOAD_DIR_GUESSES:
+            candidate_base = origin + guess_path
+            try:
+                resp = self.session.get(
+                    candidate_base + "/" + filename,
+                    timeout=self.timeout, verify=self.verify_ssl,
+                    headers=self.headers, cookies=self.cookies,
+                )
+            except requests.RequestException:
+                continue
+            if resp.status_code == 200:
+                self._guessed_upload_base = candidate_base
+                return resp
+        return None
+
     def _try_access_uploaded_file(
         self, filename: str, resp: Optional[requests.Response] = None
     ) -> Optional[requests.Response]:
         """filename에 해당하는 업로드된 파일에 실제로 접근을 시도한다.
-        resp가 주어지면 그 응답에서 저장 경로를 추출해 우선 사용하고,
-        실패하면 uploaded_file_base_url + filename으로 폴백한다."""
+        순서: ① resp(업로드 응답)에서 저장 경로 자동 추출 → ② --uploaded-base-url →
+        ①②로 URL을 하나라도 찾았으면 그 결과(상태코드 무관)를 그대로 반환한다.
+        ③ 그 둘 다 실패해 URL 자체를 못 찾았을 때만, 흔한 업로드 디렉터리 관례를
+        실제로 찔러봐서 200이 나오는 경로를 채택하는 마지막 안전망을 시도한다."""
         extracted = self._extract_storage_url(resp, filename) if resp is not None else None
         url = self._resolve_uploaded_url(filename, extracted)
-        if not url:
-            return None
-        try:
-            return self.session.get(url, timeout=self.timeout, verify=self.verify_ssl,
-                                     headers=self.headers, cookies=self.cookies)
-        except requests.RequestException:
-            return None
+        if url:
+            try:
+                return self.session.get(url, timeout=self.timeout, verify=self.verify_ssl,
+                                         headers=self.headers, cookies=self.cookies)
+            except requests.RequestException:
+                return None
+
+        return self._guess_common_upload_path(filename)
 
     def _establish_baseline(self) -> None:
         """정상적인 이미지 파일을 실제로 업로드해, 이 엔드포인트에서 '성공'이
@@ -964,12 +1238,20 @@ class FileUploadVulnScanner:
 
         v0.5: 상태코드/Content-Type만으로는 "정상 처리"와 "동일한 상태코드로
         차단 안내"를 구분 못 하는 앱이 많아, 본문(JSON이면 최상위 키 집합, 아니면
-        텍스트 원문)까지 함께 저장해 _classify_response에서 비교 기준으로 쓴다."""
+        텍스트 원문)까지 함께 저장해 _classify_response에서 비교 기준으로 쓴다.
+
+        v0.6: 이 베이스라인 업로드의 원본 응답(resp)도 self._baseline_resp에 그대로
+        보관한다. check_serving_security_headers처럼 나중에 베이스라인 파일에 다시
+        접근해야 하는 체크가 이 응답을 넘겨받아 _extract_storage_url()로 저장 경로를
+        자동 추출할 수 있게 하기 위함 (이전에는 이 응답을 안 넘겨서 --uploaded-base-url
+        없이는 무조건 N/A로 빠지는 문제가 있었음)."""
         filename = f"diag_baseline_{uuid.uuid4().hex[:8]}.png"
         resp, err = self._post_file(filename, self.BASELINE_PNG, "image/png")
         if err or resp is None:
             self.baseline = None
+            self._baseline_resp = None
             return
+        self._baseline_resp = resp
         self.baseline = {
             "status_code": resp.status_code,
             "status_family": resp.status_code // 100,
@@ -1524,7 +1806,10 @@ class FileUploadVulnScanner:
             )
 
         baseline_filename = self.baseline["filename"]
-        access_resp = self._try_access_uploaded_file(baseline_filename)
+        # v0.6: 베이스라인 업로드의 원본 응답(self._baseline_resp)을 넘겨서, 다른 체크들과
+        # 동일하게 저장 경로 자동 추출(JSON 키/Location 헤더/본문 경로 패턴)을 시도한다.
+        # 예전에는 이 인자를 안 넘겨서 --uploaded-base-url을 안 주면 무조건 N/A였다.
+        access_resp = self._try_access_uploaded_file(baseline_filename, self._baseline_resp)
         if access_resp is None:
             return self._build(
                 vuln, "N/A", "낮음",
@@ -1746,6 +2031,7 @@ class FileUploadVulnScanner:
             "scanned_at": datetime.now().isoformat(),
             "baseline_established": self.baseline is not None,
             "waf_suspected": self._waf_suspected,
+            "ai_judge_enabled": self._ai_judge is not None,
             "summary": self._summary(),
             "results": [r.to_dict() for r in self.results],
             # 대상 서버에 실제로 전송을 시도한 파일 목록. looks_successful=True인
@@ -1753,6 +2039,10 @@ class FileUploadVulnScanner:
             # 이 목록을 참고해 수동으로 정리했는지(또는 cleanup_attempted 결과를)
             # 반드시 확인할 것.
             "attempted_uploads": self.attempted_uploads,
+            # 규칙 기반으로는 판정 못 하던 지점에서 AI가 실제로 개입해 success/blocked를
+            # 확정한 이력. 비어있으면 이번 실행에서 AI가 개입할 일이 없었다는 뜻
+            # (규칙만으로 전부 판정됐거나, ai_judge_enabled가 False였다는 뜻).
+            "ai_judged_log": self.ai_judged_log,
         }
         with open(path, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
@@ -1890,8 +2180,145 @@ class InsecureCodeAnalyzer:
 
 
 # --------------------------------------------------------------------------- #
-# CLI 진입점
+# OpenAI(gpt-5.6-sol) 기반 자연어 진단 리포트 생성
 # --------------------------------------------------------------------------- #
+
+class AIVulnerabilityReporter:
+    """
+    파일 업로드 진단 결과(DiagnosisResult 목록) 중 '취약'으로 판정된 항목들을
+    OpenAI API(gpt-5.6-sol)에 넘겨, 항목별로 들여쓰기와 구분이 깔끔하게 된
+    자연어 취약점 설명 + 대응방안 요약을 생성한다.
+
+    이 클래스는 "판정"에는 관여하지 않는다 — status/risk/evidence/reason은
+    이미 스캐너가 규칙 기반으로 확정한 값을 그대로 쓰고, AI는 그 결과를 사람이
+    읽기 좋은 자연어로 정리하는 역할만 한다 (판정 자체를 AI가 새로 내리지 않으므로
+    스캐너의 정확성/재현성에는 영향을 주지 않는다).
+
+    Streamlit 등 다른 화면단에서 쓸 때는 build_dashboard_response()를 호출하면,
+    구조화된 JSON(results_json)과 AI가 생성한 자연어 요약(ai_summary)을
+    한 번에 담은 dict 하나를 그대로 response로 넘길 수 있다.
+    """
+
+    DEFAULT_MODEL = "gpt-5.6-sol"
+
+    def __init__(self, api_key: Optional[str] = None, model: str = DEFAULT_MODEL):
+        # API 키는 인자로 직접 받거나, 없으면 환경변수 OPENAI_API_KEY를 사용한다.
+        # 여기서 키를 강제로 요구하지 않는 이유: 이 클래스를 import만 하고 실제로는
+        # AI 요약 없이 results_json만 쓰고 싶은 경우도 있을 수 있어서다(그런 경우
+        # generate_summary()를 호출하는 시점에만 키 누락 에러가 난다).
+        self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
+        self.model = model
+        self._client = None
+
+    def _get_client(self):
+        if self._client is not None:
+            return self._client
+        try:
+            from openai import OpenAI
+        except ImportError as e:
+            raise RuntimeError(
+                "openai 패키지가 설치되어 있지 않습니다. `pip install openai` 로 설치 후 다시 시도하세요."
+            ) from e
+        if not self.api_key:
+            raise RuntimeError(
+                "OpenAI API 키가 없습니다. AIVulnerabilityReporter(api_key=...)로 직접 넘기거나 "
+                "환경변수 OPENAI_API_KEY를 설정하세요."
+            )
+        self._client = OpenAI(api_key=self.api_key)
+        return self._client
+
+    @staticmethod
+    def _build_prompt(vulnerable_results: List[DiagnosisResult]) -> str:
+        """모델에게 넘길 프롬프트를 만든다. 각 항목의 판정 근거(evidence/reason)와
+        권고안(recommendation)은 이미 스캐너가 확정한 값 그대로 넘기고, '이 사실들을
+        각 항목별로 보기 좋게 정리해서 써 달라'는 요약/서식 작업만 맡긴다 — 모델이
+        새로운 취약점을 판단하거나 근거를 지어내지 않도록 프롬프트 자체에서 못박는다."""
+        lines = [
+            "아래는 파일 업로드 취약점 자동 진단 도구가 '취약'으로 판정한 항목들이다.",
+            "각 항목의 status/risk/evidence/reason/recommendation은 이미 도구가 규칙 기반으로 "
+            "확정한 사실이니 그대로 반영하고, 새로운 취약점을 추가하거나 근거를 임의로 바꾸지 말 것.",
+            "",
+            "각 항목을 아래 형식으로 번호를 매겨 순서대로, 들여쓰기를 사용해 깔끔하게 정리해줘:",
+            "",
+            "N. <취약점명> (위험도: <risk>)",
+            "    - 취약점 설명: <evidence와 reason을 자연스러운 한 문단으로 요약>",
+            "    - 대응방안: <recommendation을 실행 가능한 조치 문장으로 정리>",
+            "",
+            "다른 설명이나 서론/결론 문장 없이, 번호 매긴 항목들만 순서대로 출력할 것.",
+            "",
+            "=== 진단 결과 원본 ===",
+        ]
+        for i, r in enumerate(vulnerable_results, start=1):
+            lines.append(
+                f"{i}. vulnerability={r.vulnerability} | risk={r.risk} | confidence={r.confidence}\n"
+                f"   evidence={r.evidence}\n"
+                f"   reason={r.reason}\n"
+                f"   recommendation={r.recommendation}"
+            )
+        return "\n".join(lines)
+
+    def generate_summary(self, results: List[DiagnosisResult], only_vulnerable: bool = True) -> str:
+        """취약 항목들을 항목별로 들여쓰기해서 정리한 자연어 요약을 반환한다."""
+        target = [r for r in results if r.status == "취약"] if only_vulnerable else list(results)
+        if not target:
+            return "취약으로 판정된 항목이 없습니다."
+
+        client = self._get_client()
+        prompt = self._build_prompt(target)
+        response = client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": "너는 보안 진단 결과를 항목별로 정리해 보고하는 보조 도구다. "
+                                               "판정 자체를 바꾸지 말고 주어진 사실만 보기 좋게 정리해라."},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        return response.choices[0].message.content
+
+    @staticmethod
+    def to_json(results: List[DiagnosisResult]) -> List[Dict[str, Any]]:
+        """status/risk/evidence/reason/recommendation/confidence 등 전체 필드를
+        그대로 담은 JSON(리스트[dict])을 반환한다. DiagnosisResult.to_dict()를
+        그대로 모은 것뿐이지만, Streamlit 팀이 이 이름으로 바로 찾아 쓸 수 있게
+        헬퍼로 노출해둔다."""
+        return [r.to_dict() for r in results]
+
+    def build_dashboard_response(
+        self, results: List[DiagnosisResult], *, only_vulnerable_in_summary: bool = True,
+        include_ai_summary: bool = True,
+    ) -> Dict[str, Any]:
+        """Streamlit 등 대시보드 쪽에 그대로 넘길 최종 response dict를 만든다.
+
+        반환 형태:
+        {
+          "model": "gpt-5.6-sol",
+          "generated_at": "2026-...",
+          "vulnerable_count": 7,
+          "ai_summary": "1. 위험 확장자 업로드 허용 ...(자연어, 항목별 정리)",
+          "results_json": [ {vulnerability, status, risk, evidence, reason,
+                              recommendation, parameter, payload, confidence, ...}, ... ]
+        }
+        AI 호출이 실패해도(키 누락, 네트워크 오류 등) results_json은 항상 정상적으로
+        채워지며, ai_summary 자리에는 에러 메시지가 대신 들어간다 — 구조화된 결과가
+        AI 문제 때문에 통째로 안 나오는 일이 없도록 한다."""
+        results_json = self.to_json(results)
+        vulnerable_count = sum(1 for r in results if r.status == "취약")
+
+        ai_summary = ""
+        if include_ai_summary:
+            try:
+                ai_summary = self.generate_summary(results, only_vulnerable=only_vulnerable_in_summary)
+            except Exception as e:
+                ai_summary = f"[AI 요약 생성 실패: {e}]"
+
+        return {
+            "model": self.model,
+            "generated_at": datetime.now().isoformat(),
+            "vulnerable_count": vulnerable_count,
+            "ai_summary": ai_summary,
+            "results_json": results_json,
+        }
+
 
 def _parse_kv_list(items: Optional[List[str]], sep: str) -> Dict[str, str]:
     """'Key: Value' 또는 'key=value' 형태의 문자열 리스트를 dict로 변환"""
@@ -1943,6 +2370,22 @@ def main():
                          help="[--url 사용 시 필수] 이 대상에 대해 진단 권한이 있음을 명시적으로 확인. "
                               "실서비스/운영 환경을 실수로 공격하는 사고를 막기 위한 안전장치")
 
+    # OpenAI(gpt-5.6-sol) 기반 자연어 진단 리포트 생성 (선택)
+    parser.add_argument("--ai-summary", action="store_true",
+                         help="취약 항목들을 OpenAI(gpt-5.6-sol)로 자연어 요약해 함께 저장함. "
+                              "OPENAI_API_KEY 환경변수 또는 --openai-api-key 필요")
+    parser.add_argument("--openai-api-key", default=None,
+                         help="OpenAI API 키. 생략 시 OPENAI_API_KEY 환경변수를 사용")
+    parser.add_argument("--ai-model", default=AIVulnerabilityReporter.DEFAULT_MODEL,
+                         help=f"사용할 OpenAI 모델 (기본: {AIVulnerabilityReporter.DEFAULT_MODEL})")
+    parser.add_argument("--ai-output", default=None,
+                         help="AI 요약 + 결과 JSON을 담은 대시보드용 응답을 저장할 경로 "
+                              "(생략 시 '<--output 파일명>.ai_report.json')")
+    parser.add_argument("--ai-judge-ambiguous", action="store_true",
+                         help="규칙 기반(_classify_response)으로 성공/차단을 못 가르는 애매한 응답에 한해, "
+                              "OpenAI(gpt-5.6-sol)가 베이스라인과 이번 응답을 비교해 직접 최종 판정을 내리게 함. "
+                              "OPENAI_API_KEY 필요. 규칙이 이미 확신을 가진 판정은 절대 건드리지 않음")
+
     args = parser.parse_args()
 
     if not args.url and not args.analyze_file:
@@ -1979,6 +2422,9 @@ def main():
                 cleanup=args.cleanup,
                 dos_size_mb=args.dos_size_mb,
                 skip_dos=not args.run_dos_test,
+                ai_judge_ambiguous=args.ai_judge_ambiguous,
+                openai_api_key=args.openai_api_key,
+                ai_model=args.ai_model,
             )
         except ValueError as e:
             parser.error(str(e))
@@ -2013,6 +2459,16 @@ def main():
 
     out_path = scanner.save_json(args.output)
     print(f"[*] 결과 저장 완료: {out_path}")
+
+    if args.ai_summary:
+        print(f"[*] OpenAI({args.ai_model}) 기반 자연어 요약 생성 중...")
+        reporter = AIVulnerabilityReporter(api_key=args.openai_api_key, model=args.ai_model)
+        dashboard_response = reporter.build_dashboard_response(scanner.results)
+        ai_output_path = args.ai_output or (os.path.splitext(args.output)[0] + ".ai_report.json")
+        with open(ai_output_path, "w", encoding="utf-8") as f:
+            json.dump(dashboard_response, f, ensure_ascii=False, indent=2)
+        print(f"[*] AI 요약 리포트 저장 완료: {ai_output_path}")
+        print("\n" + dashboard_response["ai_summary"])
 
     # 대상 서버에 실제로 업로드가 성공한 것으로 보이는 진단용 파일이 있다면
     # 잔여 아티팩트로 남아있을 수 있으므로 반드시 정리 여부를 안내한다.

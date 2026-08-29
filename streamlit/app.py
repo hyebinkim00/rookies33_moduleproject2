@@ -833,7 +833,9 @@ def fetch_realtime_scan_results(
     return combined_results
 
 
-# 진단 결과는 통합 API 실행 결과를 session_state에서 사용합니다.
+# 자동 진단 결과는 로컬 JSON 파일이 아니라 통합 API 실시간 결과만 사용합니다.
+# 이전 버전의 FILE_UPLOAD_RESULTS / XSS_RESULT_FILE / SQLI_RESULT_FILE /
+# SESSION_RESULT_FILE 및 load_results() 의존성을 제거했습니다.
 results = st.session_state.get(
     "realtime_scan_results",
     []
@@ -843,21 +845,18 @@ file_upload_data = []
 
 result_data = {
     "filenames": [],
-    "saved_at": (
-        [
-            st.session_state.get(
-                "realtime_scanned_at",
-                datetime.now().isoformat()
-            )
-        ]
-        if results
-        else []
-    )
+    "saved_at": [
+        st.session_state.get(
+            "realtime_scanned_at",
+            datetime.now().isoformat()
+        )
+    ] if results else []
 }
 
 
 # 수동 진단 결과는 사용자가 업로드한 파일을 session_state에 저장해 사용합니다.
-# 수동 진단 결과는 업로드한 XLSX를 session_state에서 사용합니다.
+# 기존 manual_results.json 자동 로드는 제거하여,
+# 실제 사용자 수동 진단 결과와 자동 진단 결과를 비교하는 흐름으로 통일합니다.
 manual_results = st.session_state.get(
     "uploaded_manual_results",
     []
@@ -994,14 +993,43 @@ def _normalize_manual_column_name(value):
 
 def _normalize_vulnerability_key(value):
     """
-    수동/자동 결과의 취약점명을 비교할 때
-    대소문자와 불필요한 공백 차이만 무시합니다.
+    수동/자동 결과의 취약점명을 비교할 때 표기 차이를 정규화합니다.
+
+    예:
+    - SQL Injection (Error-based)
+    - SQL Injection - Error Based
+    - SQL Injection (Error Based)
+
+    위 표기들은 모두 동일한 비교 키로 처리합니다.
+    기존 비교 로직은 유지하고, 취약점명 매칭에만 적용됩니다.
     """
-    return re.sub(
-        r"\s+",
+    normalized = str(value or "").strip().lower()
+
+    # 유니코드 대시/구분자를 일반 공백으로 통일합니다.
+    normalized = normalized.replace("–", "-").replace("—", "-")
+
+    # 괄호, 하이픈, 슬래시 등 표기용 문장부호 차이를 무시합니다.
+    normalized = re.sub(
+        r"[\(\)\[\]\{\}_\-:/]+",
         " ",
-        str(value).strip()
-    ).lower()
+        normalized
+    )
+
+    # 일부 스캐너가 붙여 쓰는 대표 표현도 동일하게 취급합니다.
+    normalized = re.sub(r"\berrorbased\b", "error based", normalized)
+    normalized = re.sub(r"\bbooleanbased\b", "boolean based", normalized)
+    normalized = re.sub(r"\btimebased\b", "time based", normalized)
+
+    # 연속 공백 정리
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+
+    # 수동진단의 Error-based 항목과 자동진단의
+    # Error/Boolean-based 통합 항목을 동일한 비교 키로 매핑합니다.
+    # 실제 스캐너 판정값/표시명 자체는 변경하지 않고 비교 키에만 적용합니다.
+    if normalized == "sql injection error based":
+        normalized = "sql injection error boolean based"
+
+    return normalized
 
 
 def _normalize_manual_records(records):
@@ -1577,9 +1605,13 @@ if st.session_state.get(
         )
     )
 
-has_vulnerability = any(
-    item.get("status") == "취약"
-    for item in results
+has_vulnerability = (
+    any(
+        item.get("status") == "취약"
+        for item in results
+    )
+    if results
+    else None
 )
 
 saved_at_list = result_data.get(
@@ -1689,7 +1721,10 @@ def aggregate_results(raw_results):
             for item in vulnerable_items
         ))
 
-        evidence = (
+        # 파일 업로드 진단은 취약점명 기준으로 집계하되,
+        # 각 스캐너가 반환한 원본 탐지 내용(evidence)과 판단 근거(reason)를
+        # 버리지 않고 최종 상세 결과에 함께 보존합니다.
+        summary_evidence = (
             f"총 {len(items)}개 파일 점검 / "
             f"취약 {len(vulnerable_items)}건 / "
             f"양호 {len(safe_items)}건 / "
@@ -1697,7 +1732,8 @@ def aggregate_results(raw_results):
         )
 
         if final_status == "취약":
-            reason = (
+            detail_source_items = vulnerable_items
+            summary_reason = (
                 f"총 {len(items)}개 파일 중 "
                 f"{len(vulnerable_items)}개 파일에서 "
                 "해당 취약점이 탐지되어 취약으로 판정함"
@@ -1712,7 +1748,8 @@ def aggregate_results(raw_results):
             recommendation = " / ".join(recommendations)
 
         elif final_status == "양호":
-            reason = (
+            detail_source_items = safe_items or items
+            summary_reason = (
                 f"점검한 {len(items)}개 파일에서 "
                 "해당 취약점이 탐지되지 않아 양호로 판정함"
             )
@@ -1727,7 +1764,8 @@ def aggregate_results(raw_results):
             )
 
         else:
-            reason = (
+            detail_source_items = items
+            summary_reason = (
                 "점검 결과만으로 양호 또는 취약을 "
                 "일관되게 판정하기 어려워 N/A로 분류함"
             )
@@ -1735,6 +1773,49 @@ def aggregate_results(raw_results):
             recommendation = (
                 "N/A 사유를 확인한 후 추가 점검 필요"
             )
+
+        def _collect_detail_text(source_items, field_name):
+            details = []
+
+            for source_item in source_items:
+                value = str(
+                    source_item.get(field_name, "") or ""
+                ).strip()
+
+                if not value:
+                    continue
+
+                source_name = str(
+                    source_item.get("source_file", "") or ""
+                ).strip()
+
+                # 여러 파일의 결과가 합쳐질 때 어떤 파일의 근거인지 식별 가능하게 표시
+                if len(items) > 1 and source_name:
+                    detail = f"[{source_name}] {value}"
+                else:
+                    detail = value
+
+                if detail not in details:
+                    details.append(detail)
+
+            return details
+
+        evidence_details = _collect_detail_text(
+            detail_source_items,
+            "evidence"
+        )
+        reason_details = _collect_detail_text(
+            detail_source_items,
+            "reason"
+        )
+
+        evidence = summary_evidence
+        if evidence_details:
+            evidence += "\n" + "\n".join(evidence_details)
+
+        reason = summary_reason
+        if reason_details:
+            reason += "\n" + "\n".join(reason_details)
 
         payloads = list(dict.fromkeys(
             item.get("payload", "")
@@ -1796,22 +1877,26 @@ na = sum(
 
 
 # 요약 DataFrame
+# 최초 실행 시에는 아직 실시간 진단 결과가 없을 수 있으므로,
+# 대시보드가 정상 렌더링되도록 공통 스키마의 빈 DataFrame을 사용합니다.
+RESULT_COLUMNS = [
+    "vulnerability",
+    "status",
+    "risk",
+    "evidence",
+    "reason",
+    "recommendation",
+    "parameter",
+    "payload",
+    "confidence",
+    "tested_at",
+    "source_type",
+    "source_file"
+]
+
 df = pd.DataFrame(
     aggregated_results,
-    columns=[
-        "vulnerability",
-        "status",
-        "risk",
-        "evidence",
-        "reason",
-        "recommendation",
-        "parameter",
-        "payload",
-        "confidence",
-        "tested_at",
-        "source_type",
-        "source_file"
-    ]
+    columns=RESULT_COLUMNS
 )
 
 display_df = df[
@@ -2272,7 +2357,7 @@ selected_view = st.segmented_control(
         "요약",
         "상세 대시보드",
         "수동 진단 비교",
-        "AI 보안 분석"
+        "AI 기반 종합 분석"
     ],
     default="실시간 자동진단 연결",
     selection_mode="single",
@@ -2636,7 +2721,9 @@ if selected_view == "실시간 자동진단 연결":
 
                     try:
 
+                        # --------------------------------------------------
                         # 실제 업로드 파일 진단
+                        # --------------------------------------------------
                         # 기존 동작은 유지하면서, 통합 자동진단이 실행되는 동안
                         # 새 민원 첨부파일이 올라오면 약 3초 간격으로 확인해
                         # 새로 발견된 파일만 추가 분석합니다.
@@ -2916,7 +3003,7 @@ if selected_view == "실시간 자동진단 연결":
 
         with action_col2:
             if st.button(
-                "진단 결과 초기화",
+                "기존 결과로 전환",
                 key="reset_realtime_scan",
                 use_container_width=True
             ):
@@ -3492,9 +3579,11 @@ if selected_view == "상세 대시보드":
         "3. 파일 업로드 진단 상세 결과"
     )
 
+    # ------------------------------------------------------------------
     # A. 기존 create.php 업로드 엔드포인트 진단
     #    기존 통합 스캐너 결과를 그대로 유지합니다.
     #    diag_xxx.php 같은 개별 payload 하위 목록은 화면에서 제거합니다.
+    # ------------------------------------------------------------------
     file_upload_results = [
         item
         for item in results
@@ -3565,8 +3654,10 @@ if selected_view == "상세 대시보드":
                 hide_index=True
             )
 
+    # ------------------------------------------------------------------
     # B. 실제 사용자가 업로드한 파일 자체 진단
     #    PDF/JPG/PNG 등 실제 파일명 기준으로 결과를 표시합니다.
+    # ------------------------------------------------------------------
     actual_file_reports = st.session_state.get(
         "realtime_uploaded_file_results",
         []
@@ -4427,6 +4518,7 @@ if selected_view == "수동 진단 비교":
                 }
             )
 
+            # 기본 Altair 범례를 제거하고 차트 아래에 직접 중앙 정렬합니다.
             agreement_chart = (
                 alt.Chart(
                     agreement_chart_df
@@ -4451,28 +4543,61 @@ if selected_view == "수동 진단 비교":
                                 "#FF6B6B"
                             ]
                         ),
-                        legend=alt.Legend(
-                            orient="bottom",
-                            title=None
-                        )
+                        legend=None
                     ),
                     tooltip=[
                         alt.Tooltip(
-                            "비교 결과:N"
+                            "비교 결과:N",
+                            title="비교 결과"
                         ),
                         alt.Tooltip(
-                            "건수:Q"
+                            "건수:Q",
+                            title="건수"
                         )
                     ]
                 )
                 .properties(
-                    height=270
+                    height=245,
+                    padding={
+                        "top": 4,
+                        "left": 0,
+                        "right": 0,
+                        "bottom": 0
+                    }
+                )
+                .configure_view(
+                    stroke=None
                 )
             )
 
             st.altair_chart(
                 agreement_chart,
                 use_container_width=True
+            )
+
+            st.markdown(
+                """
+                <div style="
+                    display:flex;
+                    justify-content:center;
+                    align-items:center;
+                    gap:16px;
+                    margin-top:-8px;
+                    margin-bottom:4px;
+                    width:100%;
+                    font-size:14px;
+                ">
+                    <span>
+                        <span style="color:#38BDF8;">●</span>
+                        일치
+                    </span>
+                    <span>
+                        <span style="color:#FF6B6B;">●</span>
+                        불일치
+                    </span>
+                </div>
+                """,
+                unsafe_allow_html=True
             )
 
         with chart_col2:
@@ -4548,14 +4673,28 @@ if selected_view == "수동 진단 비교":
                             "양호",
                             "N/A"
                         ],
-                        title=None
+                        title=None,
+                        axis=alt.Axis(
+                            labelAngle=0,
+                            labelPadding=8
+                        )
                     ),
-                    xOffset="진단 방식:N",
+                    xOffset=alt.XOffset(
+                        "진단 방식:N"
+                    ),
                     y=alt.Y(
                         "건수:Q",
-                        title="건수",
+                        title=[
+                            "건",
+                            "수"
+                        ],
                         axis=alt.Axis(
-                            tickMinStep=1
+                            tickMinStep=1,
+                            titleAngle=0,
+                            titleAlign="center",
+                            titleAnchor="middle",
+                            titleLineHeight=14,
+                            titlePadding=10
                         )
                     ),
                     color=alt.Color(
@@ -4572,23 +4711,30 @@ if selected_view == "수동 진단 비교":
                         ),
                         legend=alt.Legend(
                             orient="bottom",
+                            direction="horizontal",
                             title=None
                         )
                     ),
                     tooltip=[
                         alt.Tooltip(
-                            "진단 방식:N"
+                            "진단 방식:N",
+                            title="진단 방식"
                         ),
                         alt.Tooltip(
-                            "판정:N"
+                            "판정:N",
+                            title="판정"
                         ),
                         alt.Tooltip(
-                            "건수:Q"
+                            "건수:Q",
+                            title="건수"
                         )
                     ]
                 )
                 .properties(
-                    height=270
+                    height=245
+                )
+                .configure_view(
+                    stroke=None
                 )
             )
 
@@ -4868,15 +5014,67 @@ if selected_view == "수동 진단 비교":
             "상단 양식을 내려받아 작성하면 취약점명이 자동진단 항목과 정확히 매칭됩니다."
         )
 
-# TAB 4 - AI 보안 분석
-if selected_view == "AI 보안 분석":
+# TAB 4 - AI 기반 종합 분석
+if selected_view == "AI 기반 종합 분석":
 
-    st.subheader("AI 보안 분석")
+    st.subheader("AI 기반 종합 분석")
 
     st.caption(
         "진단 데이터를 기반으로 AI 종합 분석, "
         "SQL Injection 보조 검증 및 보안 질의를 수행합니다."
     )
+
+    # ------------------------------------------------------------------
+    # AI 참고용 실제 업로드 파일 진단 결과
+    # ------------------------------------------------------------------
+    # 대시보드의 공식 전체/취약/양호/N/A 집계는 aggregated_results를 그대로 사용하고,
+    # 실제 민원에 첨부된 PDF/JPG/PNG 등의 정적 분석 결과는 별도 참고 데이터로 AI에 전달합니다.
+    # 따라서 화면의 공식 건수와 AI가 언급하는 공식 건수는 기존 값과 일치하면서도,
+    # 사용자가 실제 업로드 파일(PDF 포함)에 대해 질문하면 해당 파일 결과를 근거로 답변할 수 있습니다.
+    actual_file_ai_results = []
+
+    for report in st.session_state.get(
+        "realtime_uploaded_file_results",
+        []
+    ):
+        if not isinstance(report, dict):
+            continue
+
+        actual_filename = str(
+            report.get(
+                "filename",
+                "알 수 없는 파일"
+            )
+        ).strip()
+
+        file_url = report.get(
+            "file_url"
+        )
+
+        inquiry_id = report.get(
+            "inquiry_id"
+        )
+
+        for item in report.get(
+            "results",
+            []
+        ):
+            if not isinstance(item, dict):
+                continue
+
+            item_copy = item.copy()
+            item_copy["source_type"] = "실제 업로드 파일 진단"
+            item_copy["source_file"] = actual_filename
+
+            if file_url:
+                item_copy["file_url"] = file_url
+
+            if inquiry_id is not None:
+                item_copy["inquiry_id"] = inquiry_id
+
+            actual_file_ai_results.append(
+                item_copy
+            )
 
     # Hugging Face SQL Injection 보조 분석용 결과 탐색
     # 단일 항목이 아니라 취약으로 판정된 SQL Injection 결과 전체를 수집합니다.
@@ -5045,7 +5243,8 @@ if selected_view == "AI 보안 분석":
                     try:
 
                         analysis = analyze_results(
-                            aggregated_results
+                            aggregated_results,
+                            supplemental_results=actual_file_ai_results
                         )
 
                         st.session_state[
@@ -5404,7 +5603,8 @@ if selected_view == "AI 보안 분석":
 
                         answer = ask_security_question(
                             aggregated_results,
-                            security_question
+                            security_question,
+                            supplemental_results=actual_file_ai_results
                         )
 
                         st.session_state[
@@ -5470,7 +5670,7 @@ if selected_view == "AI 보안 분석":
         ):
 
             with st.spinner(
-                "PDF 보고서를 생성하고 있습니다..."
+                "PDF 진단 결과 보고서를 생성하고 있습니다..."
             ):
 
                 try:
@@ -5486,7 +5686,7 @@ if selected_view == "AI 보안 분석":
                     ] = pdf_data
 
                     st.success(
-                        "PDF 보고서 생성이 완료되었습니다."
+                        "PDF 진단 결과 보고서 생성이 완료되었습니다."
                     )
 
                 except Exception as e:
@@ -5504,7 +5704,7 @@ if selected_view == "AI 보안 분석":
         ):
 
             with st.spinner(
-                "XLSX 결과보고서를 생성하고 있습니다..."
+                "XLSX 진단 결과 보고서를 생성하고 있습니다..."
             ):
 
                 try:
@@ -5526,13 +5726,13 @@ if selected_view == "AI 보안 분석":
                     ] = xlsx_data
 
                     st.success(
-                        "XLSX 결과보고서 생성이 완료되었습니다."
+                        "XLSX 진단 결과 보고서 생성이 완료되었습니다."
                     )
 
                 except Exception as e:
 
                     st.error(
-                        f"XLSX 결과보고서 생성 중 오류가 발생했습니다: {e}"
+                        f"XLSX 진단 결과 보고서 생성 중 오류가 발생했습니다: {e}"
                     )
 
     download_col1, download_col2 = st.columns(2)
@@ -5544,11 +5744,11 @@ if selected_view == "AI 보안 분석":
         ):
 
             st.download_button(
-                label="PDF 보고서 다운로드",
+                label="PDF 진단 결과 보고서 다운로드",
                 data=st.session_state[
                     "generated_pdf"
                 ],
-                file_name="vulnerability_report.pdf",
+                file_name="진단_결과_보고서.pdf",
                 mime="application/pdf",
                 use_container_width=True
             )
@@ -5560,11 +5760,11 @@ if selected_view == "AI 보안 분석":
         ):
 
             st.download_button(
-                label="XLSX 결과보고서 다운로드",
+                label="XLSX 진단 결과 보고서 다운로드",
                 data=st.session_state[
                     "generated_xlsx"
                 ],
-                file_name="vulnerability_report.xlsx",
+                file_name="진단_결과_보고서.xlsx",
                 mime=(
                     "application/vnd.openxmlformats-officedocument."
                     "spreadsheetml.sheet"

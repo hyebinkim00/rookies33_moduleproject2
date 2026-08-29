@@ -1,28 +1,36 @@
-# 환경변수
-.env
-
-# Python
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-
-# 가상환경
+# Virtual Environment
 .venv/
 venv/
-env/
 
-# 진단 결과/임시 JSON
-*_scan_result_*.json
-178*.json
-manual_results.json
+# Environment Variables / API Keys
+.env
+.env.*
+!.env.example
 
-# 생성 결과
-reports/
-generated/
+# Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
 
-# IDE/OS
+# Python Build
+build/
+dist/
+*.egg-info/
+
+# Test / Tool Cache
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# VS Code
 .vscode/
-.idea/
+
+# OS
 .DS_Store
 Thumbs.db
+
+# Logs
+*.log

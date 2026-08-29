@@ -4,9 +4,12 @@ unified_scanner_api.py
 4개의 독립적인 취약점 진단 도구(파일 업로드 / SQL Injection / 세션-인증 / XSS)를
 대시보드가 단일 API로 호출할 수 있도록 감싸는 통합 REST API 서버.
 
-기존 file-upload 부분(ver4_file_upload_vuln_scanner.py 래핑)은 그대로 유지했고,
-sqli_scanner.py / session_scanner.py / xss_crawler_scanner_improved.py 세 개를
-동일한 설계 패턴(비동기 job + 동기 sync 엔드포인트)으로 추가했다.
+기존 file-upload 부분(ver5_file_upload_vuln_scanner.py 래핑)은 그대로 유지했고,
+sqli_scanner.py / session_scanner.py / xss_scanner_ai.py 세 개도 이제 별도로
+import하지 않고, ver5_file_upload_vuln_scanner.py가 이미 재노출해둔
+sqli_scanner / session_scanner / xss_scanner_ai를 통해 한 곳에서 가져온다
+(즉 이 파일은 import 대상이 ver5_file_upload_vuln_scanner.py 하나뿐이다).
+각 도구의 진단 로직 자체는 전혀 건드리지 않았다.
 
 핵심 요구사항: "대시보드에서 진단을 누르면 4개가 동시에 실행"
   -> POST /api/v1/scan/all         : 4개 스캐너를 각각 별도 백그라운드 스레드로
@@ -25,9 +28,12 @@ POST .../sync)를 그대로 제공한다.
   vulnerability, status(양호/취약/N/A), risk(낮음/중간/높음),
   evidence, reason, recommendation, parameter, payload, confidence, tested_at
 (단, file-upload는 위 스키마를 DiagnosisResult로, 나머지 셋은 dict로 반환한다.
- 최종적으로는 모두 JSON이므로 대시보드 입장에서는 필드가 동일하게 보인다.)
+ 최종적으로는 모두 JSON이므로 대시보드 입장에서는 필드가 동일하게 보인다.
+ 다만 confidence 허용값은 완전히 같지 않다 — file-upload는 "확정"/"추정" 두 값만
+ 쓰고, sqli/session/xss는 "확정"/"추정"/"판단불가" 세 값을 쓴다. 각 도구 원본
+ 그대로 가져온 것이라 이 차이를 통일하지 않았다.)
 
-XSS 스캐너(xss_crawler_scanner_improved.py)는 Playwright(헤드리스 브라우저)가
+XSS 스캐너(xss_scanner_ai.py)는 Playwright(헤드리스 브라우저)가
 필요하다. 설치돼 있지 않으면 이 서버 자체는 정상 기동하되, XSS 관련 엔드포인트만
 503으로 "설치 필요" 안내를 반환한다 (서버 전체가 죽지 않도록 방어적으로 처리).
 
@@ -54,25 +60,30 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from ver4_file_upload_vuln_scanner import (
+from ver6_file_upload_vuln_scanner import (
     FileUploadVulnScanner,
     FileFormatNameAnalyzer,
+    AIVulnerabilityReporter,
     TOOL_VERSION,
+    sqli_scanner,
+    session_scanner,
+    xss_scanner_ai as _xss_mod,
+    _sqli_scanner_import_error,
+    _session_scanner_import_error,
+    _xss_scanner_ai_import_error,
 )
 
-from sqli_scanner import run_all as _sqli_run_all
-from session_scanner import run_all as _session_run_all
+# sqli_scanner.py / session_scanner.py는 requests만 있으면 되므로 사실상 항상 로드되지만,
+# xss_scanner_ai.py는 playwright(헤드리스 브라우저)가 있어야 로드된다. 셋 다
+# ver5_file_upload_vuln_scanner.py가 이미 방어적으로 임포트해뒀으므로(실패해도 None),
+# 여기서는 그 결과만 그대로 이어받아 API 가용성 플래그로 쓴다.
+SQLI_AVAILABLE = sqli_scanner is not None
+SESSION_AVAILABLE = session_scanner is not None
+XSS_AVAILABLE = _xss_mod is not None
+_xss_import_error: Optional[str] = _xss_scanner_ai_import_error
 
-# XSS 스캐너는 Playwright(헤드리스 브라우저) 의존성이 있어, 설치 안 된 환경에서도
-# 나머지 3개 스캐너 API는 정상 동작하도록 임포트를 방어적으로 처리한다.
-try:
-    import xss_scanner_add_dom as _xss_mod
+if XSS_AVAILABLE:
     from playwright.sync_api import sync_playwright as _sync_playwright
-    XSS_AVAILABLE = True
-    _xss_import_error: Optional[str] = None
-except ImportError as e:
-    XSS_AVAILABLE = False
-    _xss_import_error = str(e)
 
 
 app = FastAPI(title="통합 취약점 진단 API", version="2.0.0")
@@ -144,6 +155,26 @@ class ScanRequest(BaseModel):
     request_delay: float = 0.3
     cleanup: bool = False
 
+    # --- OpenAI(gpt-5.6-sol) 관련 옵션 ---
+    # 규칙 기반(_classify_response)으로 성공/차단을 못 가르는 애매한 응답에서만,
+    # AI가 베이스라인과 이번 응답을 비교해 최종 판정을 내리게 할지 여부.
+    # 규칙이 이미 확신을 가진 판정에는 절대 개입하지 않는다.
+    ai_judge_ambiguous: bool = Field(
+        False, description="애매한 판정에 한해 OpenAI가 최종 success/blocked를 확정하게 함"
+    )
+    # 취약 항목들을 사람이 읽기 좋은 자연어(항목별 정리)로 요약해 결과에 함께 담을지 여부.
+    # 판정 자체에는 관여하지 않고, 이미 나온 결과를 정리하는 역할만 한다.
+    include_ai_summary: bool = Field(
+        False, description="취약 항목들을 OpenAI로 자연어 요약해 ai_summary 필드에 포함"
+    )
+    openai_api_key: Optional[str] = Field(
+        None, description="OpenAI API 키. 생략 시 서버의 OPENAI_API_KEY 환경변수(.env 포함)를 사용"
+    )
+    ai_model: str = Field(
+        AIVulnerabilityReporter.DEFAULT_MODEL,
+        description=f"AI 판정/요약에 사용할 모델 (기본: {AIVulnerabilityReporter.DEFAULT_MODEL})",
+    )
+
 
 class FileAnalyzeTriggerRequest(BaseModel):
     target_url: str = Field(..., description="이 파일이 업로드된 엔드포인트 URL (참고/조회용)")
@@ -176,26 +207,41 @@ def _build_scanner(req: ScanRequest) -> FileUploadVulnScanner:
         max_retries=req.max_retries,
         request_delay=req.request_delay,
         cleanup=req.cleanup,
+        ai_judge_ambiguous=req.ai_judge_ambiguous,
+        openai_api_key=req.openai_api_key,
+        ai_model=req.ai_model,
     )
 
 
-def _run_and_load_json(scanner: FileUploadVulnScanner) -> Dict[str, Any]:
+def _run_and_load_json(scanner: FileUploadVulnScanner, req: Optional[ScanRequest] = None) -> Dict[str, Any]:
     """scanner.run_all()을 실행하고, 기존에 검증된 save_json()의 스키마를 그대로
-    재사용해 결과 dict를 만든다."""
+    재사용해 결과 dict를 만든다. req.include_ai_summary가 True면, 방금 나온
+    scanner.results를 바탕으로 OpenAI 자연어 요약을 만들어 'ai_summary' 필드로 덧붙인다
+    (AI 요약 생성이 실패해도 나머지 결과는 그대로 반환됨 — 구조화된 결과가 AI 문제 때문에
+    통째로 안 나오는 일이 없도록)."""
     scanner.run_all()
     fd, tmp_path = tempfile.mkstemp(suffix=".json")
     os.close(fd)
     try:
         scanner.save_json(tmp_path)
         with open(tmp_path, "r", encoding="utf-8") as f:
-            return json.load(f)
+            result = json.load(f)
     finally:
         os.remove(tmp_path)
+
+    if req is not None and req.include_ai_summary:
+        try:
+            reporter = AIVulnerabilityReporter(api_key=req.openai_api_key, model=req.ai_model)
+            result["ai_summary"] = reporter.generate_summary(scanner.results)
+        except Exception as e:
+            result["ai_summary"] = f"[AI 요약 생성 실패: {e}]"
+
+    return result
 
 
 def _run_file_upload_job(job_id: str, req: ScanRequest) -> None:
     try:
-        result = _run_and_load_json(_build_scanner(req))
+        result = _run_and_load_json(_build_scanner(req), req)
         _finish_job(_jobs, _jobs_lock, job_id, result=result)
     except Exception as e:
         _finish_job(_jobs, _jobs_lock, job_id, error=str(e))
@@ -267,7 +313,7 @@ def get_file_upload_result(job_id: str) -> JobRecord:
 @app.post("/api/v1/scan/file-upload/sync")
 def start_file_upload_sync(req: ScanRequest) -> Dict[str, Any]:
     _validate_target(req.target_url, req.confirm_authorized)
-    return _run_and_load_json(_build_scanner(req))
+    return _run_and_load_json(_build_scanner(req), req)
 
 
 # =========================================================================== #
@@ -284,14 +330,29 @@ class SqliScanRequest(BaseModel):
     pw_param: str = "pw"
     success_indicator: str = "환영합니다"
     allow_destructive: bool = False
+    # sqli_scanner.py는 모든 판정을 생성형 AI(OpenAI)에게 맡긴다 — 코드가 관찰한
+    # 사실(technical_evidence)만 근거로 status/risk/confidence/reason/recommendation을
+    # 최종 판정하며, 키가 없으면 자동으로 N/A(판단불가)로 폴백한다(스캔 자체는 안 죽음).
+    openai_api_key: Optional[str] = Field(
+        None, description="OpenAI API 키. 생략 시 서버의 OPENAI_API_KEY 환경변수(.env 포함) 사용"
+    )
+    ai_model: str = Field("gpt-4o-mini", description="판정에 사용할 OpenAI 모델")
 
 
 _sqli_jobs: Dict[str, JobRecord] = {}
 _sqli_jobs_lock = threading.Lock()
 
 
+def _require_sqli_available() -> None:
+    if not SQLI_AVAILABLE:
+        raise HTTPException(status_code=503, detail=f"sqli_scanner 모듈을 불러올 수 없습니다: {_sqli_scanner_import_error}")
+
+
 def _run_sqli(req: SqliScanRequest) -> Dict[str, Any]:
-    results = _sqli_run_all(
+    _require_sqli_available()
+    client, client_error = sqli_scanner.get_openai_client(req.openai_api_key)
+    results = sqli_scanner.run_all(
+        client=client,
         base_url=req.base_url,
         search_path=req.search_path,
         search_param=req.search_param,
@@ -300,8 +361,14 @@ def _run_sqli(req: SqliScanRequest) -> Dict[str, Any]:
         pw_param=req.pw_param,
         success_indicator=req.success_indicator,
         allow_destructive=req.allow_destructive,
+        model=req.ai_model,
     )
-    return {"results": results}
+    payload: Dict[str, Any] = {"results": results}
+    if client is None:
+        # 판정 자체는 각 결과별로 이미 N/A(판단불가)로 폴백돼 있지만, "왜 전부 N/A인지"를
+        # 응답 최상위에서도 바로 보이게 별도 필드로 남긴다.
+        payload["ai_warning"] = client_error
+    return payload
 
 
 def _run_sqli_job(job_id: str, req: SqliScanRequest) -> None:
@@ -321,6 +388,7 @@ def _start_sqli_job(req: SqliScanRequest) -> JobRecord:
 
 @app.post("/api/v1/scan/sqli", response_model=JobRecord)
 def start_sqli_scan(req: SqliScanRequest) -> JobRecord:
+    _require_sqli_available()
     _validate_target(req.base_url, req.confirm_authorized)
     return _start_sqli_job(req)
 
@@ -367,14 +435,27 @@ class SessionScanRequest(BaseModel):
     logout_fail_indicator: str = "로그인이 필요합니다"
     cookie_name: str = "PHPSESSID"
     session_timeout_wait: int = 0  # opt-in. 0(기본)이면 idle timeout 항목은 건너뜀
+    openai_api_key: Optional[str] = Field(
+        None, description="OpenAI API 키. 생략 시 서버의 OPENAI_API_KEY 환경변수(.env 포함) 사용"
+    )
+    ai_model: str = Field("gpt-4o-mini", description="판정에 사용할 OpenAI 모델")
 
 
 _session_jobs: Dict[str, JobRecord] = {}
 _session_jobs_lock = threading.Lock()
 
 
+def _require_session_available() -> None:
+    if not SESSION_AVAILABLE:
+        raise HTTPException(status_code=503,
+                             detail=f"session_scanner 모듈을 불러올 수 없습니다: {_session_scanner_import_error}")
+
+
 def _run_session(req: SessionScanRequest) -> Dict[str, Any]:
-    results = _session_run_all(
+    _require_session_available()
+    client, client_error = session_scanner.get_openai_client(req.openai_api_key)
+    results = session_scanner.run_all(
+        client=client,
         base_url=req.base_url,
         login_path=req.login_path,
         logout_path=req.logout_path,
@@ -386,8 +467,12 @@ def _run_session(req: SessionScanRequest) -> Dict[str, Any]:
         logout_fail_indicator=req.logout_fail_indicator,
         cookie_name=req.cookie_name,
         session_timeout_wait=req.session_timeout_wait,
+        model=req.ai_model,
     )
-    return {"results": results}
+    payload: Dict[str, Any] = {"results": results}
+    if client is None:
+        payload["ai_warning"] = client_error
+    return payload
 
 
 def _run_session_job(job_id: str, req: SessionScanRequest) -> None:
@@ -407,6 +492,7 @@ def _start_session_job(req: SessionScanRequest) -> JobRecord:
 
 @app.post("/api/v1/scan/session", response_model=JobRecord)
 def start_session_scan(req: SessionScanRequest) -> JobRecord:
+    _require_session_available()
     _validate_target(req.base_url, req.confirm_authorized)
     if req.session_timeout_wait > 0:
         # 실제로 그 시간만큼 대기하는 항목이라, 잘못된 값이면 API가 오래 묶일 수 있어 상한을 둔다.
@@ -461,21 +547,42 @@ class XssScanRequest(BaseModel):
     register_url: str = "/auth/register.php"
     register_name: str = "XSS Tester"
     register_name_field: str = "name"
-    # None이면 xss_crawler_scanner_improved.py 모듈 기본 로그인 계정(LOGIN_ID/LOGIN_PW)을 그대로 사용.
+    # None이면 xss_scanner_ai.py 모듈 기본 로그인 계정(LOGIN_ID/LOGIN_PW)을 그대로 사용.
     # 값을 주면 그 요청을 처리하는 동안만 모듈 전역값을 바꿔서 사용한다 (아래 _run_xss 주석 참고).
     login_id: Optional[str] = None
     login_pw: Optional[str] = None
+    # xss_scanner_ai.py는 스캔 후 raw evidence를 생성형 AI(OpenAI)로 최종 보강하는데,
+    # 이 키를 함수 인자가 아니라 환경변수(OPENAI_API_KEY/OPENAI_MODEL)로만 읽는다.
+    # 여기 값을 주면 이번 스캔이 도는 동안만 그 환경변수를 임시로 바꿔서 쓴다.
+    openai_api_key: Optional[str] = Field(
+        None, description="OpenAI API 키. 생략 시 서버의 OPENAI_API_KEY 환경변수(.env 포함) 사용"
+    )
+    ai_model: Optional[str] = Field(
+        None, description="AI 결과 보강에 사용할 모델. 생략 시 xss_scanner_ai.py 기본값 사용"
+    )
 
 
 _xss_jobs: Dict[str, JobRecord] = {}
 _xss_jobs_lock = threading.Lock()
 
-# xss_crawler_scanner_improved.authenticate()가 LOGIN_ID/LOGIN_PW를 모듈 전역
-# 상수로 참조하기 때문에(함수 인자로 안 받음), 계정을 요청마다 다르게 쓰려면
-# 호출 전에 이 전역값을 바꿔줘야 한다. 여러 XSS 스캔이 동시에(멀티스레드로) 도는
-# 동안 서로 다른 계정을 쓰면 경합이 생길 수 있으므로, 계정을 스레드마다 다르게
-# 쓸 계획이 있다면 이 락으로 감싸 순서를 보장한다. (같은 계정만 쓴다면 문제 없음.)
+# xss_scanner_ai.py의 authenticate()는 LOGIN_ID/LOGIN_PW를, call_openai_json()은
+# OPENAI_API_KEY/OPENAI_MODEL을 각각 모듈 전역 상수·환경변수로 참조한다(함수 인자로
+# 안 받음). 요청마다 다른 값을 쓰려면 스캔 전체를 이 락으로 감싸 임시로 바꿔치기하고
+# 끝나면 원래 값으로 복원해야 한다 — 그 사이 다른 XSS 스캔 요청은 대기하게 되지만,
+# 파일업로드/SQLi/세션 스캔과는 여전히 완전히 동시에 진행된다.
 _xss_login_patch_lock = threading.Lock()
+
+
+def _require_xss_available() -> None:
+    if not XSS_AVAILABLE:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"playwright가 설치되어 있지 않아 XSS 진단 기능을 사용할 수 없습니다 ({_xss_import_error}). "
+                f"서버에서 'pip install playwright --break-system-packages && playwright install chromium' "
+                f"실행 후 서버를 재시작하세요."
+            ),
+        )
 
 
 def _run_xss(req: XssScanRequest) -> Dict[str, Any]:
@@ -508,37 +615,67 @@ def _run_xss(req: XssScanRequest) -> Dict[str, Any]:
         if req.login_pw is not None:
             _xss_mod.LOGIN_PW = req.login_pw
 
-        session = requests.Session()
-        auth_result = _xss_mod.authenticate(session, args)
-        pages, forms = _xss_mod.crawl(session, args.base_url, args.max_depth, args.max_pages)
+        prev_api_key = os.environ.get("OPENAI_API_KEY")
+        prev_model = os.environ.get("OPENAI_MODEL")
+        if req.openai_api_key is not None:
+            os.environ["OPENAI_API_KEY"] = req.openai_api_key
+        if req.ai_model is not None:
+            os.environ["OPENAI_MODEL"] = req.ai_model
 
-    reflected_targets = _xss_mod.reflected_targets_from(pages, forms)
-    meta = {
-        "base_url": args.base_url,
-        "auth": auth_result,
-        "crawled_pages": len(pages),
-        "discovered_forms": len(forms),
-    }
+        try:
+            session = requests.Session()
+            auth_result = _xss_mod.authenticate(session, args)
+            pages, forms = _xss_mod.crawl(session, args.base_url, args.max_depth, args.max_pages)
+            reflected_targets = _xss_mod.reflected_targets_from(pages, forms)
+            # xss_scanner_ai.py의 main()과 동일한 흐름: 스캔에 앞서 AI 보강용 컨텍스트를
+            # 먼저 만들어두고, 스캔이 다 끝난 뒤 raw evidence를 AI로 최종 보강한다.
+            ai_context = _xss_mod.build_ai_scan_context(pages, forms, reflected_targets)
 
-    with _sync_playwright() as playwright:
-        try:
-            browser = playwright.chromium.launch(headless=True)
-        except Exception as error:
-            return _xss_mod.browser_start_failure(error, meta)
-        try:
-            scan_types = set(args.scan or ["reflected", "stored", "dom"])
-            scan_results: Dict[str, Any] = {}
-            if "reflected" in scan_types:
-                scan_results["reflected_xss"] = _xss_mod.scan_reflected_xss(browser, session, reflected_targets)
-            if "stored" in scan_types:
-                scan_results["stored_xss"] = _xss_mod.scan_stored_xss(
-                    browser, session, forms, pages, args.allow_post, args.cleanup_url
-                )
-            if "dom" in scan_types:
-                scan_results["dom_xss"] = _xss_mod.scan_dom_xss(browser, session, pages)
-            return {"meta": meta, "xss_scan_result": scan_results}
+            meta = {
+                "base_url": args.base_url,
+                "auth": auth_result,
+                "crawled_pages": len(pages),
+                "discovered_forms": len(forms),
+                "ai": {
+                    "enabled": _xss_mod.AI_ANALYSIS_ENABLED,
+                    "api_key_available": bool(os.getenv("OPENAI_API_KEY")),
+                    "model": os.getenv("OPENAI_MODEL", _xss_mod.AI_MODEL),
+                },
+            }
+
+            with _sync_playwright() as playwright:
+                try:
+                    browser = playwright.chromium.launch(headless=True)
+                except Exception as error:
+                    return _xss_mod.browser_start_failure(error, meta)
+                try:
+                    scan_types = set(args.scan or ["reflected", "stored", "dom"])
+                    scan_results: Dict[str, Any] = {}
+                    if "reflected" in scan_types:
+                        scan_results["reflected_xss"] = _xss_mod.scan_reflected_xss(browser, session, reflected_targets)
+                    if "stored" in scan_types:
+                        scan_results["stored_xss"] = _xss_mod.scan_stored_xss(
+                            browser, session, forms, pages, args.allow_post, args.cleanup_url
+                        )
+                    if "dom" in scan_types:
+                        scan_results["dom_xss"] = _xss_mod.scan_dom_xss(browser, session, pages)
+                    final_result = {"meta": meta, "xss_scan_result": scan_results}
+                    final_result["meta"]["ai"].update(_xss_mod.enhance_result_with_ai(final_result, ai_context))
+                    return final_result
+                finally:
+                    browser.close()
         finally:
-            browser.close()
+            # 다른 요청/스캐너에 영향 주지 않도록 환경변수를 원래 값으로 되돌린다.
+            if req.openai_api_key is not None:
+                if prev_api_key is None:
+                    os.environ.pop("OPENAI_API_KEY", None)
+                else:
+                    os.environ["OPENAI_API_KEY"] = prev_api_key
+            if req.ai_model is not None:
+                if prev_model is None:
+                    os.environ.pop("OPENAI_MODEL", None)
+                else:
+                    os.environ["OPENAI_MODEL"] = prev_model
 
 
 def _run_xss_job(job_id: str, req: XssScanRequest) -> None:
@@ -554,18 +691,6 @@ def _start_xss_job(req: XssScanRequest) -> JobRecord:
         _xss_jobs[job.job_id] = job
     threading.Thread(target=_run_xss_job, args=(job.job_id, req), daemon=True).start()
     return job
-
-
-def _require_xss_available() -> None:
-    if not XSS_AVAILABLE:
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                f"playwright가 설치되어 있지 않아 XSS 진단 기능을 사용할 수 없습니다 ({_xss_import_error}). "
-                f"서버에서 'pip install playwright --break-system-packages && playwright install chromium' "
-                f"실행 후 서버를 재시작하세요."
-            ),
-        )
 
 
 @app.post("/api/v1/scan/xss", response_model=JobRecord)
@@ -645,6 +770,7 @@ def _build_unified_sub_requests(req: UnifiedScanRequest):
     fu_req = req.file_upload or ScanRequest(
         target_url=req.upload_url or (req.base_url.rstrip("/") + "/src/inquiry/create.php"),
         confirm_authorized=req.confirm_authorized,
+        uploaded_file_base_url=req.base_url.rstrip("/") + "/uploads",
     )
     sqli_req = req.sqli or SqliScanRequest(base_url=req.base_url, confirm_authorized=req.confirm_authorized)
     session_req = req.session or SessionScanRequest(base_url=req.base_url, confirm_authorized=req.confirm_authorized)
@@ -771,7 +897,7 @@ def start_all_scans_sync(req: UnifiedScanRequest) -> Dict[str, Any]:
     if req.run_file_upload:
         _validate_target(fu_req.target_url, fu_req.confirm_authorized)
         threads.append(threading.Thread(
-            target=_run_and_store, args=("file_upload", lambda: _run_and_load_json(_build_scanner(fu_req)))
+            target=_run_and_store, args=("file_upload", lambda: _run_and_load_json(_build_scanner(fu_req), fu_req))
         ))
     if req.run_sqli:
         threads.append(threading.Thread(target=_run_and_store, args=("sqli", lambda: _run_sqli(sqli_req))))
@@ -800,6 +926,13 @@ def health() -> Dict[str, Any]:
     return {
         "status": "ok",
         "file_upload_tool_version": TOOL_VERSION,
+        "sqli_available": SQLI_AVAILABLE,
+        "sqli_unavailable_reason": _sqli_scanner_import_error,
+        "session_available": SESSION_AVAILABLE,
+        "session_unavailable_reason": _session_scanner_import_error,
         "xss_available": XSS_AVAILABLE,
         "xss_unavailable_reason": _xss_import_error,
+        # 서버 환경변수(.env 포함)로 OPENAI_API_KEY가 잡혀있는지. 대시보드에서
+        # openai_api_key를 매번 안 보내도 되는 조건인지 미리 확인할 때 씀.
+        "openai_configured": bool(os.environ.get("OPENAI_API_KEY")),
     }

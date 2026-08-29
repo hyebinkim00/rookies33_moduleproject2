@@ -275,8 +275,7 @@ def generate_pdf_report(
 
     elements.append(
         Paragraph(
-            "AI 기반 공공 민원포털<br/>"
-            "취약점 자동 진단 결과 보고서",
+            "진단 결과 보고서",
             cover_title_style
         )
     )
